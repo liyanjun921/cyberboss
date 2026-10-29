@@ -27,6 +27,11 @@ async function runSystemCheckinPoller(config) {
     console.log(`[cyberboss] next checkin in ${Math.round(delayMs / 60000)}m at ${wakeAt}`);
     await sleep(delayMs);
 
+    if (isQuietTime(new Date())) {
+      console.log("[cyberboss] checkin skipped: quiet hours");
+      continue;
+    }
+
     if (queue.hasPendingForAccount(account.accountId)) {
       console.log("[cyberboss] checkin skipped: pending system message still in queue");
       continue;
@@ -110,4 +115,15 @@ function buildCheckinTrigger(config) {
   return INTERNAL_CHECKIN_TRIGGER_TEMPLATE.replace("%USER%", userName);
 }
 
-module.exports = { runSystemCheckinPoller };
+function isQuietTime(now, env = process.env) {
+  if (env.CYBERBOSS_QUIET_START_HOUR === undefined || env.CYBERBOSS_QUIET_END_HOUR === undefined) return false;
+  const start = Number(env.CYBERBOSS_QUIET_START_HOUR);
+  const end = Number(env.CYBERBOSS_QUIET_END_HOUR);
+  if (!Number.isInteger(start) || !Number.isInteger(end) || start < 0 || start > 23 || end < 0 || end > 23 || start === end) return false;
+  const hour = Number(new Intl.DateTimeFormat("en-GB", {
+    timeZone: env.CYBERBOSS_QUIET_TIMEZONE || "Asia/Shanghai", hour: "2-digit", hourCycle: "h23",
+  }).format(now));
+  return start < end ? hour >= start && hour < end : hour >= start || hour < end;
+}
+
+module.exports = { runSystemCheckinPoller, isQuietTime };
