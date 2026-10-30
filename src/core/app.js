@@ -164,6 +164,7 @@ class CyberbossApp {
     try {
       let consecutiveFailures = 0;
       while (!shutdown.stopped) {
+        let phase = "flush_pre_poll";
         try {
           await Promise.all([
             this.flushDueReminders(account),
@@ -171,6 +172,7 @@ class CyberbossApp {
             this.flushPendingSystemMessages(),
             this.flushPendingTimelineScreenshots(account),
           ]);
+          phase = "getUpdates";
           const response = await this.channelAdapter.getUpdates({
             syncBuffer: this.channelAdapter.loadSyncBuffer(),
             timeoutMs: this.resolveLongPollTimeoutMs(),
@@ -178,12 +180,14 @@ class CyberbossApp {
           assertWeixinUpdateResponse(response);
           consecutiveFailures = 0;
           const messages = sortInboundUpdateMessages(Array.isArray(response?.msgs) ? response.msgs : []);
+          phase = "handle_inbound";
           for (const message of messages) {
             if (shutdown.stopped) {
               break;
             }
             await this.handleIncomingMessage(message);
           }
+          phase = "flush_post_poll";
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -200,7 +204,7 @@ class CyberbossApp {
           }
 
           consecutiveFailures += 1;
-          console.error(`[cyberboss] poll failed: ${formatErrorMessage(error)}`);
+          console.error(`[cyberboss] bridge request failed phase=${phase}: ${formatErrorMessage(error)}`);
           await sleep(consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? BACKOFF_DELAY_MS : RETRY_DELAY_MS);
         }
       }
