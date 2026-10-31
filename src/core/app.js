@@ -192,6 +192,7 @@ class CyberbossApp {
         this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot, 100);
       }
       while (!shutdown.stopped) {
+        let phase = "flush_pre_poll";
         try {
           await Promise.all([
             this.flushDueReminders(account),
@@ -201,6 +202,7 @@ class CyberbossApp {
           ]);
           // A slow media download must not block the long-poll loop.
           // Crucially, do not advance get_updates_buf before the complete batch is durable.
+          phase = "getUpdates";
           const oldBuffer = this.channelAdapter.loadSyncBuffer();
           const response = await this.channelAdapter.getUpdates({
             syncBuffer: oldBuffer,
@@ -208,6 +210,7 @@ class CyberbossApp {
             persistBuffer: false,
           });
           assertWeixinUpdateResponse(response);
+          phase = "enqueue_inbound";
           const messages = sortInboundUpdateMessages(Array.isArray(response?.msgs) ? response.msgs : []);
           this.durableInboundQueue.enqueueBatch(messages);
           const newBuffer = String(response?.get_updates_buf || "").trim();
@@ -216,6 +219,7 @@ class CyberbossApp {
           }
           this.kickInboundDrain();
           consecutiveFailures = 0;
+          phase = "flush_post_poll";
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -232,7 +236,7 @@ class CyberbossApp {
           }
 
           consecutiveFailures += 1;
-          console.error(`[cyberboss] poll failed: ${formatErrorMessage(error)}`);
+          console.error(`[cyberboss] bridge request failed phase=${phase}: ${formatErrorMessage(error)}`);
           await sleep(consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? BACKOFF_DELAY_MS : RETRY_DELAY_MS);
         }
       }
