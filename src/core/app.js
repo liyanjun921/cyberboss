@@ -5,6 +5,7 @@ const fs = require("fs");
 const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
 const { DEFAULT_MIN_WEIXIN_CHUNK, MAX_MIN_WEIXIN_CHUNK } = require("../adapters/channel/weixin/config-store");
 const { persistIncomingWeixinAttachments } = require("../adapters/channel/weixin/media-receive");
+const { DurableInboundQueue } = require("./durable-inbound-queue");
 const { createCodexRuntimeAdapter } = require("../adapters/runtime/codex");
 const { createClaudeCodeRuntimeAdapter } = require("../adapters/runtime/claudecode");
 const { findModelByQuery } = require("../adapters/runtime/codex/model-catalog");
@@ -83,6 +84,12 @@ class CyberbossApp {
     this.reminderQueue = new ReminderQueueStore({ filePath: config.reminderQueueFile });
     this.turnGateStore = new TurnGateStore();
     this.pendingInboundByScope = new Map();
+    // Durable local spool: incoming WeChat checkpoints only advance after enqueue succeeds.
+    this.durableInboundQueue = new DurableInboundQueue({
+      filePath: path.join(config.stateDir, "inbound-spool.json"),
+    });
+    this.inboundDrainPromise = null;
+    this.inboundDrainStopped = false;
     this.pendingImageInboundByScope = new Map();
     this.turnBoundaryScopeKeys = new Set();
     this.systemMessageDispatcher = null;
@@ -160,6 +167,7 @@ class CyberbossApp {
     }
 
     const shutdown = createShutdownController(async () => {
+      this.inboundDrainStopped = true;
       this.clearPendingImageInboundTimers();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -167,6 +175,8 @@ class CyberbossApp {
 
     try {
       let consecutiveFailures = 0;
+      // Recover work persisted before a previous crash, before receiving newer updates.
+      this.kickInboundDrain();
       while (!shutdown.stopped) {
         try {
           await Promise.all([
@@ -175,19 +185,23 @@ class CyberbossApp {
             this.flushPendingSystemMessages(),
             this.flushPendingTimelineScreenshots(account),
           ]);
+          // A slow media download must not block the long-poll loop.
+          // Crucially, do not advance get_updates_buf before the complete batch is durable.
+          const oldBuffer = this.channelAdapter.loadSyncBuffer();
           const response = await this.channelAdapter.getUpdates({
-            syncBuffer: this.channelAdapter.loadSyncBuffer(),
+            syncBuffer: oldBuffer,
             timeoutMs: this.resolveLongPollTimeoutMs(),
+            persistBuffer: false,
           });
           assertWeixinUpdateResponse(response);
-          consecutiveFailures = 0;
           const messages = sortInboundUpdateMessages(Array.isArray(response?.msgs) ? response.msgs : []);
-          for (const message of messages) {
-            if (shutdown.stopped) {
-              break;
-            }
-            await this.handleIncomingMessage(message);
+          this.durableInboundQueue.enqueueBatch(messages);
+          const newBuffer = String(response?.get_updates_buf || "").trim();
+          if (newBuffer && newBuffer !== oldBuffer) {
+            this.channelAdapter.saveSyncBuffer(newBuffer);
           }
+          this.kickInboundDrain();
+          consecutiveFailures = 0;
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -210,6 +224,7 @@ class CyberbossApp {
       }
     } finally {
       shutdown.dispose();
+      this.inboundDrainStopped = true;
       this.clearPendingImageInboundTimers();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -324,6 +339,36 @@ class CyberbossApp {
       userId: senderId,
       filePath,
     }, {});
+  }
+
+  kickInboundDrain() {
+    if (this.inboundDrainStopped || this.inboundDrainPromise || !this.durableInboundQueue.pendingCount) {
+      return;
+    }
+    const runner = async () => {
+      let failures = 0;
+      while (!this.inboundDrainStopped && this.durableInboundQueue.pendingCount > 0) {
+        const job = this.durableInboundQueue.peek();
+        if (!job) break;
+        try {
+          await this.handleIncomingMessage(job.raw);
+          // An item is acknowledged only after processing successfully returns.
+          this.durableInboundQueue.ack(job.key);
+          failures = 0;
+        } catch (error) {
+          failures += 1;
+          console.error(
+            `[cyberboss] inbound spool handler failed; keeping local job for retry count=${failures} code=${error?.code || error?.name || "ERROR"}`
+          );
+          await sleep(Math.min(30_000, 1_000 * 2 ** Math.min(failures, 5)));
+        }
+      }
+    };
+    this.inboundDrainPromise = runner().catch((error) => {
+      console.error(`[cyberboss] inbound spool drain failed: ${formatErrorMessage(error)}`);
+    }).finally(() => {
+      this.inboundDrainPromise = null;
+    });
   }
 
   async handleIncomingMessage(message) {
