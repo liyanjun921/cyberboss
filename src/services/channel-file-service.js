@@ -1,5 +1,4 @@
-const fs = require("fs");
-const path = require("path");
+const { validateOutboundFile } = require("./outbound-file-policy");
 
 const { resolveSelectedAccount } = require("../adapters/channel/weixin/account-store");
 const { loadPersistedContextTokens } = require("../adapters/channel/weixin/context-token-store");
@@ -31,18 +30,8 @@ class ChannelFileService {
       throw new Error(`Cannot find a context token for user ${targetUserId}. Let this user talk to the bot once first.`);
     }
 
-    const requestedPath = normalizeText(filePath);
-    if (!requestedPath) {
-      throw new Error("Missing file path to send.");
-    }
-    const resolvedPath = path.resolve(requestedPath);
-    if (!fs.existsSync(resolvedPath)) {
-      throw new Error(`File does not exist: ${resolvedPath}`);
-    }
-    const stat = fs.statSync(resolvedPath);
-    if (!stat.isFile()) {
-      throw new Error(`Only files can be sent, not directories: ${resolvedPath}`);
-    }
+    // Validate before making any network request, and use the real path to block symlink escapes.
+    const resolvedPath = validateOutboundFile(filePath, this.config);
 
     await this.channelAdapter.sendTyping({
       userId: targetUserId,
