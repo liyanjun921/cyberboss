@@ -38,15 +38,20 @@ class StickerService {
 
   async saveFromInbox({ items = [], userId = "" } = {}, context = {}) {
     ensureStickerCatalogFilesSync(this.config);
-    const normalizedItems = normalizeStickerSaveItems(items, this.config);
+    if (!Array.isArray(items) || items.length < 1 || items.length > MAX_STICKER_SAVE_BATCH_SIZE) {
+      throw new Error(`Sticker save items must contain 1 to ${MAX_STICKER_SAVE_BATCH_SIZE} entries.`);
+    }
+
     const index = loadStickerIndexSync(this.config);
     const tagCatalog = loadStickerTagsSync(this.config);
     const hashByStickerId = buildStickerHashIndex(this.config, index);
     const createdPaths = [];
     const results = [];
 
-    try {
-      for (const item of normalizedItems) {
+    for (const [itemIndex, rawItem] of items.entries()) {
+      try {
+        // Validate each item separately so one malformed image cannot abort the batch.
+        const [item] = normalizeStickerSaveItems([rawItem], this.config);
         const saved = await saveStickerEntry({
           config: this.config,
           index,
@@ -54,37 +59,50 @@ class StickerService {
           hashByStickerId,
           item,
         });
-        results.push(saved.result);
+        results.push({ ...saved.result, itemIndex });
         if (saved.createdPath) {
           createdPaths.push(saved.createdPath);
         }
+      } catch (error) {
+        results.push({
+          itemIndex,
+          created: false,
+          deduped: false,
+          failed: true,
+          reason: error instanceof Error ? error.message : String(error || "Sticker save failed"),
+        });
       }
+    }
 
-      const createdCount = results.filter((item) => item.created).length;
-      if (createdCount > 0) {
+    const createdCount = results.filter((item) => item.created).length;
+    const dedupedCount = results.filter((item) => item.deduped).length;
+    const failedCount = results.filter((item) => item.failed).length;
+
+    // Only metadata persistence failure rolls back newly written assets.
+    // One failed image never removes other successfully converted images.
+    if (createdCount > 0) {
+      try {
         await writeJsonFile(this.config.stickersIndexFile, index);
         await writeJsonFile(this.config.stickerTagsFile, tagCatalog);
-        for (const item of results) {
-          if (!item.created) {
-            continue;
-          }
-          await this.sendContextText({
-            text: buildStickerSavedText(item),
-            userId,
-            context,
-      });
+      } catch (error) {
+        await Promise.all(createdPaths.map((filePath) => fsp.rm(filePath, { force: true }).catch(() => {})));
+        throw error;
+      }
     }
-  }
 
-      return {
-        results,
+    // Notification delivery is best-effort; it must not undo a committed batch.
+    await this.sendContextText({
+      text: buildStickerBatchSummaryText({
+        receivedCount: items.length,
         createdCount,
-        dedupedCount: results.filter((item) => item.deduped).length,
-      };
-    } catch (error) {
-      await Promise.all(createdPaths.map((filePath) => fsp.rm(filePath, { force: true }).catch(() => {})));
-      throw error;
-    }
+        dedupedCount,
+        failedCount,
+      }),
+      userId,
+      context,
+    }).catch(() => {});
+
+    return { results, createdCount, dedupedCount, failedCount };
   }
 
   async pick({ tag = "", limit = DEFAULT_PICK_LIMIT } = {}) {
@@ -417,6 +435,16 @@ async function normalizeStickerGif({ inputPath, outputPath, scriptPath }) {
     const message = stderr || stdout || (error instanceof Error ? error.message : String(error || "unknown error"));
     throw new Error(`Sticker GIF normalization failed: ${message}`);
   }
+}
+
+function buildStickerBatchSummaryText({ receivedCount, createdCount, dedupedCount, failedCount }) {
+  return [
+    "表情包批量处理完成",
+    `收到：${receivedCount}张`,
+    `保存：${createdCount}张`,
+    `重复：${dedupedCount}张`,
+    `失败：${failedCount}张`,
+  ].join("\\n");
 }
 
 function buildStickerSavedText({ stickerId, tags, desc }) {
