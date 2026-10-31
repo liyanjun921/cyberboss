@@ -281,6 +281,55 @@ test("sticker service updates, picks, sends, and deletes saved stickers", async 
   assert.match(sentTexts[sentTexts.length - 1].text, /表情包已删除/);
 });
 
+test("sticker retrieval resolves explicit aliases, reports real availability, and corrects the legacy good-night label", async () => {
+  const config = createConfig();
+  fs.mkdirSync(config.stickerAssetsDir, { recursive: true });
+  writeJson(config.stickersIndexFile, {
+    stk_009: {
+      tags: ["晚安", "可爱", "抱抱"],
+      desc: "抱着枕头和小熊的小猫晚安 good night",
+    },
+    stk_005: {
+      tags: ["GPT", "喜欢", "爱"],
+      desc: "小G举着玫瑰表达喜欢",
+    },
+  });
+  writeJson(config.stickerTagsFile, ["亲亲", "抱抱", "晚安", "可爱", "喜欢", "GPT"]);
+  writeTinyGif(path.join(config.stickerAssetsDir, "stk_009.gif"));
+  writeTinyGif(path.join(config.stickerAssetsDir, "stk_005.gif"));
+
+  const { service } = createService(config);
+  const catalog = await service.listTags();
+
+  assert.equal(catalog.tags.includes("想你"), true);
+  assert.equal(catalog.availableTags.includes("晚安"), true);
+  assert.equal(catalog.availableTags.includes("抱抱"), false);
+  assert.equal(catalog.emptyTags.includes("亲亲"), true);
+  assert.equal(catalog.emptyTags.includes("想你"), true);
+  assert.equal(catalog.tagCounts["晚安"], 1);
+
+  const migrated = loadStickerIndexSync(config).stk_009;
+  assert.deepEqual(migrated.tags, ["晚安", "可爱"]);
+  assert.match(migrated.desc, /good night/);
+
+  const goodNight = await service.pick({ tag: "good night" });
+  assert.equal(goodNight.tag, "晚安");
+  assert.equal(goodNight.matchedAlias, true);
+  assert.equal(goodNight.candidates[0].stickerId, "stk_009");
+
+  const kiss = await service.pick({ tag: "kiss" });
+  assert.equal(kiss.tag, "亲亲");
+  assert.deepEqual(kiss.candidates, []);
+
+  const hug = await service.pick({ tag: "hug" });
+  assert.equal(hug.tag, "抱抱");
+  assert.deepEqual(hug.candidates, []);
+
+  const missYou = await service.pick({ tag: "miss you" });
+  assert.equal(missYou.tag, "想你");
+  assert.deepEqual(missYou.candidates, []);
+});
+
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
