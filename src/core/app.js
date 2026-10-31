@@ -42,6 +42,7 @@ const {
 } = require("../adapters/runtime/shared/approval-command");
 const { runSystemCheckinPoller } = require("../app/system-checkin-poller");
 const { createProjectTooling } = require("../tools/create-project-tooling");
+const { OmbreMemoryService } = require("../services/ombre-memory-service");
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 35_000;
 const MIN_LONG_POLL_TIMEOUT_MS = 2_000;
 const SESSION_EXPIRED_ERRCODE = -14;
@@ -61,6 +62,7 @@ function createRuntimeAdapter(config) {
 class CyberbossApp {
   constructor(config) {
     this.config = config;
+    this.ombreMemory = new OmbreMemoryService(config);
     this.channelAdapter = createWeixinChannelAdapter(config);
     this.timelineIntegration = createTimelineIntegration(config);
     const projectTooling = createProjectTooling(config, {
@@ -87,6 +89,11 @@ class CyberbossApp {
       sessionStore: this.runtimeAdapter.getSessionStore(),
       runtimeId: this.runtimeAdapter.describe().id,
       onDeferredSystemReply: (payload) => this.deferSystemReply(payload),
+      onDeliveredReply: (payload) => {
+        const store = this.runtimeAdapter.getSessionStore();
+        const linked = store.findBindingForThreadId(payload.threadId);
+        if (linked) this.ombreMemory.recordDelivered({ ...store.getBinding(linked.bindingKey), ...linked, ...payload });
+      },
     });
     this.pendingOperationByRunKey = new Map();
     this.runtimeEventChain = Promise.resolve();
@@ -109,6 +116,7 @@ class CyberbossApp {
       runtime: this.runtimeAdapter.describe(),
       timeline: this.timelineIntegration.describe(),
       threads: this.threadStateStore.snapshot(),
+      sharedMemory: this.ombreMemory.status(),
     }, null, 2));
   }
 
@@ -165,6 +173,8 @@ class CyberbossApp {
       let consecutiveFailures = 0;
       while (!shutdown.stopped) {
         try {
+          // 补传在后台运行，不能让积压网络请求阻塞微信收信。
+          void this.ombreMemory.flush();
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -384,6 +394,7 @@ class CyberbossApp {
     }
 
     const workspaceRoot = this.resolveWorkspaceRoot(bindingKey);
+    this.ombreMemory?.recordUser(normalized, workspaceRoot);
     const prepared = await this.prepareIncomingMessageForRuntime(normalized, workspaceRoot);
     if (!prepared) {
       return;
@@ -435,7 +446,7 @@ class CyberbossApp {
 
     try {
       const model = this.runtimeAdapter.getSessionStore().getRuntimeParamsForWorkspace(bindingKey, workspaceRoot).model;
-      const runtimeTurn = await this.buildRuntimeTurn({ prepared, model });
+      const runtimeTurn = await this.buildRuntimeTurn({ prepared, model, workspaceRoot });
       const sendTurn = typeof this.runtimeAdapter.sendTurn === "function"
         ? this.runtimeAdapter.sendTurn.bind(this.runtimeAdapter)
         : this.runtimeAdapter.sendTextTurn.bind(this.runtimeAdapter);
@@ -487,7 +498,7 @@ class CyberbossApp {
     }
   }
 
-  async buildRuntimeTurn({ prepared, model = "" }) {
+  async buildRuntimeTurn({ prepared, model = "", workspaceRoot = this.config.workspaceRoot }) {
     if (prepared?.provider === "system") {
       return {
         text: String(prepared.text || "").trim(),
@@ -500,12 +511,13 @@ class CyberbossApp {
       runtimeAdapter: this.runtimeAdapter,
       model,
     });
+    const sharedContext = await this.ombreMemory?.context(prepared, workspaceRoot) || "";
     return {
       text: assembleRuntimeTurnText({
         prepared,
         config: this.config,
         visionContext,
-      }),
+      }) + sharedContext,
       attachments: Array.isArray(visionContext.runtimeAttachments) ? visionContext.runtimeAttachments : [],
       visionContext,
     };
@@ -1086,6 +1098,11 @@ class CyberbossApp {
       claudeContextWindow: this.config.claudeContextWindow,
       claudeMaxOutputTokens: this.config.claudeMaxOutputTokens,
     }));
+    if (this.ombreMemory) {
+      const memory = this.ombreMemory.status();
+      lines.push(`🧠 OB: ${this.ombreMemory.allowed(workspaceRoot) ? "已启用" : "未在当前工作区启用"}；待补传 ${memory.pending}；待处理 ${memory.blocked}`);
+      if (memory.lastError) lines.push(`OB 状态：${memory.lastError}`);
+    }
     await this.channelAdapter.sendText({
       userId: normalized.senderId,
       text: lines.join("\n"),
