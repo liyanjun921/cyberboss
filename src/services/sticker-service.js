@@ -317,7 +317,7 @@ function migrateLegacyStickerMetadataSync(paths = {}) {
     const isKnownGoodNightCat = tags.includes("抱抱")
       && desc.includes("小猫")
       && desc.includes("枕头")
-      && /good\\s*night/i.test(desc);
+      && /good\s*night/i.test(desc);
     if (!isKnownGoodNightCat) {
       return false;
     }
@@ -424,7 +424,7 @@ function normalizeStickerLookupText(value) {
   return normalizeText(value)
     .normalize("NFKC")
     .toLocaleLowerCase("en-US")
-    .replace(/[\\s\\u3000]+/g, " ");
+    .replace(/[\s\u3000]+/g, " ");
 }
 
 function resolveStickerTag(query, catalogTags = []) {
