@@ -444,7 +444,7 @@ function buildStickerBatchSummaryText({ receivedCount, createdCount, dedupedCoun
     `保存：${createdCount}张`,
     `重复：${dedupedCount}张`,
     `失败：${failedCount}张`,
-  ].join("\\n");
+  ].join("\n");
 }
 
 function buildStickerSavedText({ stickerId, tags, desc }) {
