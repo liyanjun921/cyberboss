@@ -13,6 +13,8 @@ const {
   resolveGardenTarget,
 } = require("../integrations/galatea-garden/inject-cyberboss");
 const { SystemMessageQueueStore } = require("../src/core/system-message-queue-store");
+const { SystemMessageService } = require("../src/services/system-message-service");
+const { persistContextToken } = require("../src/adapters/channel/weixin/context-token-store");
 
 function createFixture({ allowedUserIds = ["wechat-user-1"], workspaceRoots = [] } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "cyberboss-garden-injector-"));
@@ -180,6 +182,41 @@ test("does not guess when more than one workspace binding is available", () => {
     env: { GARDEN_CYBERBOSS_WORKSPACE_ROOT: workspaceB },
   });
   assert.equal(target.workspaceRoot, workspaceB);
+});
+
+
+test("uses the real Cyberboss SystemMessageService and persists a Garden wake", () => {
+  const fixture = createFixture();
+  const config = {
+    ...fixture.config,
+    systemMessageQueueFile: path.join(fixture.root, "system-message-queue.json"),
+  };
+  persistContextToken(config, "test-account", "wechat-user-1", "context-token-for-test");
+  const systemMessageService = new SystemMessageService({
+    config,
+    sessionStore: fixture.sessionStore,
+  });
+
+  const result = enqueueGardenWake({
+    version: 1,
+    type: "garden_wake",
+    reason: "forum_notification_available",
+    message: "有一条新的论坛通知。",
+  }, {
+    config,
+    sessionStore: fixture.sessionStore,
+    systemMessageService,
+    env: {},
+  });
+
+  const queue = new SystemMessageQueueStore({ filePath: config.systemMessageQueueFile });
+  const pending = queue.drainForAccount("test-account");
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].id, result.id);
+  assert.equal(pending[0].senderId, "wechat-user-1");
+  assert.equal(pending[0].workspaceRoot, fixture.workspaceRoot);
+  assert.match(pending[0].text, /forum_notification_available/);
+  assert.match(pending[0].text, /有一条新的论坛通知。/);
 });
 
 test("the native queue persists an accepted wake without editing session files", () => {
