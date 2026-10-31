@@ -372,7 +372,7 @@ class CyberbossApp {
   }
 
   async handleIncomingMessage(message) {
-    const normalized = this.channelAdapter.normalizeIncomingMessage(message);
+    const normalized = this.channelAdapter.normalizeIncomingMessage(message, { skipDedup: true });
     if (!normalized) {
       return;
     }
