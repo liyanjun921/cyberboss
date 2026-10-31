@@ -1,0 +1,57 @@
+name: Cyberboss media and sticker regression tests
+
+on:
+  push:
+    branches:
+      - "fix/sticker-batch-isolation-20261031"
+  pull_request:
+    paths:
+      - "src/services/sticker-service.js"
+      - "src/adapters/channel/weixin/media-receive.js"
+      - "src/core/app.js"
+      - "test/**"
+      - ".github/workflows/media-regression.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: "22"
+          - os: windows-latest
+            node: "22"
+          - os: windows-latest
+            node: "26"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: Install declared dependencies for integration tests
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: Check syntax
+        run: |
+          node --check src/services/sticker-service.js
+          node --check src/adapters/channel/weixin/media-receive.js
+          node --check src/core/app.js
+          node --check test/sticker-batch-isolation.test.js
+          node --check test/media-intake-isolation.test.js
+          node --check test/image-batching.test.js
+          node --check test/outbound-file-policy.test.js
+          node --check src/core/durable-inbound-queue.js
+          node --check test/durable-inbound-queue.test.js
+          node --check test/inbound-filter-retry.test.js
+          node --check src/core/persistent-image-batch-store.js
+          node --check test/persistent-image-batch-store.test.js
+          node --check test/pending-turn-durability.test.js
+      - name: Check all Cyberboss source files
+        run: npm run check
+      - name: Run isolated regression tests
+        run: node --test test/sticker-batch-isolation.test.js test/media-intake-isolation.test.js test/image-batching.test.js test/outbound-file-policy.test.js test/durable-inbound-queue.test.js test/inbound-filter-retry.test.js test/persistent-image-batch-store.test.js test/pending-turn-durability.test.js

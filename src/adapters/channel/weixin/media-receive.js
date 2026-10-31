@@ -4,6 +4,16 @@ const path = require("path");
 
 const DEFAULT_INBOX_DIR = "inbox";
 const MAX_FILE_NAME_LENGTH = 120;
+const DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_MS = 15_000;
+const DEFAULT_MEDIA_DOWNLOAD_CONCURRENCY = 3;
+const MAX_MEDIA_DOWNLOAD_RETRIES = 3;
+const MEDIA_RETRY_DELAYS_MS = [500, 1500, 3000];
+
+function boundedEnvInteger(name, fallback, min, max) {
+  const parsed = Number.parseInt(process.env[name] || "", 10);
+  return Number.isSafeInteger(parsed) ? Math.max(min, Math.min(max, parsed)) : fallback;
+}
+
 
 async function persistIncomingWeixinAttachments({
   attachments,
@@ -12,29 +22,40 @@ async function persistIncomingWeixinAttachments({
   messageId = "",
   receivedAt = "",
 }) {
-  const saved = [];
-  const failed = [];
+  const list = Array.isArray(attachments) ? attachments : [];
+  const outcomes = new Array(list.length);
+  let cursor = 0;
+  const concurrency = boundedEnvInteger(
+    "CYBERBOSS_MEDIA_DOWNLOAD_CONCURRENCY", DEFAULT_MEDIA_DOWNLOAD_CONCURRENCY, 1, 10
+  );
 
-  for (const attachment of Array.isArray(attachments) ? attachments : []) {
-    try {
-      const persisted = await persistSingleAttachment({
-        attachment,
-        stateDir,
-        cdnBaseUrl,
-        messageId,
-        receivedAt,
-      });
-      saved.push(persisted);
-    } catch (error) {
-      failed.push({
-        kind: attachment?.kind || "file",
-        sourceFileName: attachment?.fileName || "",
-        reason: error instanceof Error ? error.message : String(error || "unknown attachment error"),
-      });
+  // Workers reserve their index before awaiting; results are emitted in arrival order.
+  async function worker() {
+    while (cursor < list.length) {
+      const index = cursor++;
+      const attachment = list[index];
+      try {
+        const value = await persistSingleAttachment({
+          attachment, stateDir, cdnBaseUrl, messageId, receivedAt,
+        });
+        outcomes[index] = { saved: value };
+      } catch (error) {
+        outcomes[index] = {
+          failed: {
+            kind: attachment?.kind || "file",
+            sourceFileName: attachment?.fileName || "",
+            reason: error instanceof Error ? error.message : String(error || "unknown attachment error"),
+          },
+        };
+      }
     }
   }
 
-  return { saved, failed };
+  await Promise.all(Array.from({ length: Math.min(concurrency, list.length) }, () => worker()));
+  return {
+    saved: outcomes.filter((outcome) => outcome?.saved).map((outcome) => outcome.saved),
+    failed: outcomes.filter((outcome) => outcome?.failed).map((outcome) => outcome.failed),
+  };
 }
 
 async function persistSingleAttachment({ attachment, stateDir, cdnBaseUrl, messageId, receivedAt }) {
@@ -85,31 +106,74 @@ async function downloadAttachmentPayload(attachment, cdnBaseUrl) {
     throw new Error("attachment did not include a supported download reference");
   }
 
-  let lastError = null;
+  const timeoutMs = boundedEnvInteger(
+    "CYBERBOSS_MEDIA_DOWNLOAD_TIMEOUT_MS", DEFAULT_MEDIA_DOWNLOAD_TIMEOUT_MS, 1_000, 120_000
+  );
+  let lastError = new Error("attachment download failed");
   for (const candidate of candidates) {
-    try {
-      const response = await fetch(candidate, {
-        method: "GET",
-        headers: {
-          Accept: "*/*",
-        },
-      });
-      if (!response.ok) {
-        lastError = new Error(`download failed with HTTP ${response.status}`);
-        continue;
-      }
+    for (let attempt = 0; attempt <= MAX_MEDIA_DOWNLOAD_RETRIES; attempt += 1) {
+      try {
+        // The signal covers both response headers and response body reading.
+        const response = await fetch(candidate, {
+          method: "GET",
+          headers: { Accept: "*/*" },
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (!response.ok) {
+          lastError = new Error(`download failed with HTTP ${response.status}`);
+          if (attempt < MAX_MEDIA_DOWNLOAD_RETRIES && isRetryableHttpStatus(response.status)) {
+            await delayMediaRetry(attempt);
+            continue;
+          }
+          break; // Try next alternate CDN URL, not the same permanent failure.
+        }
 
-      const arrayBuffer = await response.arrayBuffer();
-      return {
-        bytes: Buffer.from(arrayBuffer),
-        contentType: normalizeContentType(response.headers.get("content-type")),
-      };
-    } catch (error) {
-      lastError = error;
+        const contentType = normalizeContentType(response.headers.get("content-type"));
+        if (contentType.includes("text/html") || contentType.includes("application/xhtml+xml")) {
+          lastError = new Error("download returned an HTML response, not media");
+          break;
+        }
+        const bytes = Buffer.from(await response.arrayBuffer());
+        if (bytes.length === 0) {
+          lastError = new Error("download returned empty media");
+          break;
+        }
+        return { bytes, contentType };
+      } catch (error) {
+        lastError = new Error(`attachment download failed: ${safeMediaErrorCode(error)}`);
+        if (attempt < MAX_MEDIA_DOWNLOAD_RETRIES && isRetryableNetworkError(error)) {
+          await delayMediaRetry(attempt);
+          continue;
+        }
+        break;
+      }
     }
   }
 
-  throw lastError || new Error("attachment download failed");
+  throw lastError;
+}
+
+function isRetryableHttpStatus(status) {
+  return status === 408 || status === 429 || (status >= 500 && status <= 599);
+}
+
+function isRetryableNetworkError(error) {
+  const code = String(error?.cause?.code || error?.code || "").toUpperCase();
+  return error?.name === "TimeoutError" || error?.name === "AbortError"
+    || error instanceof TypeError
+    || ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENOTFOUND",
+        "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT",
+        "UND_ERR_SOCKET"].includes(code);
+}
+
+function safeMediaErrorCode(error) {
+  return String(error?.cause?.code || error?.code || error?.name || "UNKNOWN").slice(0, 64);
+}
+
+function delayMediaRetry(attempt) {
+  const base = MEDIA_RETRY_DELAYS_MS[Math.min(attempt, MEDIA_RETRY_DELAYS_MS.length - 1)];
+  const jitter = Math.floor(Math.random() * 150);
+  return new Promise((resolve) => setTimeout(resolve, base + jitter));
 }
 
 function buildDownloadCandidates(attachment, cdnBaseUrl) {

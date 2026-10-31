@@ -11,7 +11,7 @@ function createInboundFilter() {
   const seen = new Map();
 
   return {
-    normalize(message, config, accountId) {
+    normalize(message, config, accountId, { skipDedup = false } = {}) {
       if (!message || typeof message !== "object") {
         return null;
       }
@@ -32,10 +32,10 @@ function createInboundFilter() {
 
       const dedupKey = buildDedupKey(message, senderId, createdAtMs);
       pruneSeen(seen);
-      if (dedupKey && seen.has(dedupKey)) {
+      if (!skipDedup && dedupKey && seen.has(dedupKey)) {
         return null;
       }
-      if (dedupKey) {
+      if (!skipDedup && dedupKey) {
         seen.set(dedupKey, Date.now());
       }
 

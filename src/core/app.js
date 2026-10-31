@@ -5,6 +5,8 @@ const fs = require("fs");
 const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
 const { DEFAULT_MIN_WEIXIN_CHUNK, MAX_MIN_WEIXIN_CHUNK } = require("../adapters/channel/weixin/config-store");
 const { persistIncomingWeixinAttachments } = require("../adapters/channel/weixin/media-receive");
+const { DurableInboundQueue } = require("./durable-inbound-queue");
+const { PersistentImageBatchStore } = require("./persistent-image-batch-store");
 const { createCodexRuntimeAdapter } = require("../adapters/runtime/codex");
 const { createClaudeCodeRuntimeAdapter } = require("../adapters/runtime/claudecode");
 const { findModelByQuery } = require("../adapters/runtime/codex/model-catalog");
@@ -49,7 +51,11 @@ const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_INBOUND_STICKER_IMAGE_BATCH = 10;
-const INBOUND_IMAGE_BATCH_IDLE_MS = 1_500;
+// How long to wait after the last image before flushing a chat-scoped batch.
+const INBOUND_IMAGE_BATCH_IDLE_MS = (() => {
+  const value = Number.parseInt(process.env.CYBERBOSS_IMAGE_BATCH_IDLE_MS || "", 10);
+  return Number.isSafeInteger(value) ? Math.max(250, Math.min(value, 60_000)) : 6_000;
+})();
 
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
@@ -78,8 +84,23 @@ class CyberbossApp {
     this.timelineScreenshotQueue = new TimelineScreenshotQueueStore({ filePath: config.timelineScreenshotQueueFile });
     this.reminderQueue = new ReminderQueueStore({ filePath: config.reminderQueueFile });
     this.turnGateStore = new TurnGateStore();
-    this.pendingInboundByScope = new Map();
-    this.pendingImageInboundByScope = new Map();
+    // Pending text/commands must survive a crash while a previous Codex turn is busy.
+    this.pendingTurnBatchStore = new PersistentImageBatchStore({
+      filePath: path.join(config.stateDir, "pending-turn-batches.json"),
+    });
+    this.pendingInboundByScope = new Map(this.pendingTurnBatchStore.load());
+    this.pendingTurnFlushScopes = new Set();
+    // Durable local spool: incoming WeChat checkpoints only advance after enqueue succeeds.
+    this.durableInboundQueue = new DurableInboundQueue({
+      filePath: path.join(config.stateDir, "inbound-spool.json"),
+    });
+    this.inboundDrainPromise = null;
+    this.inboundDrainStopped = false;
+    this.pendingImageBatchStore = new PersistentImageBatchStore({
+      filePath: path.join(config.stateDir, "pending-image-batches.json"),
+    });
+    this.pendingImageInboundByScope = new Map(this.pendingImageBatchStore.load());
+    this.pendingImageFlushScopes = new Set();
     this.turnBoundaryScopeKeys = new Set();
     this.systemMessageDispatcher = null;
     this.streamDelivery = new StreamDelivery({
@@ -156,6 +177,7 @@ class CyberbossApp {
     }
 
     const shutdown = createShutdownController(async () => {
+      this.inboundDrainStopped = true;
       this.clearPendingImageInboundTimers();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -163,7 +185,14 @@ class CyberbossApp {
 
     try {
       let consecutiveFailures = 0;
+      // Recover work persisted before a previous crash, before receiving newer updates.
+      this.kickInboundDrain();
+      // Flush previously staged image batches after a process restart.
+      for (const [scopeKey, draft] of this.pendingImageInboundByScope.entries()) {
+        this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot, 100);
+      }
       while (!shutdown.stopped) {
+        let phase = "flush_pre_poll";
         try {
           await Promise.all([
             this.flushDueReminders(account),
@@ -171,19 +200,26 @@ class CyberbossApp {
             this.flushPendingSystemMessages(),
             this.flushPendingTimelineScreenshots(account),
           ]);
+          // A slow media download must not block the long-poll loop.
+          // Crucially, do not advance get_updates_buf before the complete batch is durable.
+          phase = "getUpdates";
+          const oldBuffer = this.channelAdapter.loadSyncBuffer();
           const response = await this.channelAdapter.getUpdates({
-            syncBuffer: this.channelAdapter.loadSyncBuffer(),
+            syncBuffer: oldBuffer,
             timeoutMs: this.resolveLongPollTimeoutMs(),
+            persistBuffer: false,
           });
           assertWeixinUpdateResponse(response);
-          consecutiveFailures = 0;
+          phase = "enqueue_inbound";
           const messages = sortInboundUpdateMessages(Array.isArray(response?.msgs) ? response.msgs : []);
-          for (const message of messages) {
-            if (shutdown.stopped) {
-              break;
-            }
-            await this.handleIncomingMessage(message);
+          this.durableInboundQueue.enqueueBatch(messages);
+          const newBuffer = String(response?.get_updates_buf || "").trim();
+          if (newBuffer && newBuffer !== oldBuffer) {
+            this.channelAdapter.saveSyncBuffer(newBuffer);
           }
+          this.kickInboundDrain();
+          consecutiveFailures = 0;
+          phase = "flush_post_poll";
           await Promise.all([
             this.flushDueReminders(account),
             this.flushPendingInboundMessages(),
@@ -200,12 +236,13 @@ class CyberbossApp {
           }
 
           consecutiveFailures += 1;
-          console.error(`[cyberboss] poll failed: ${formatErrorMessage(error)}`);
+          console.error(`[cyberboss] bridge request failed phase=${phase}: ${formatErrorMessage(error)}`);
           await sleep(consecutiveFailures >= MAX_CONSECUTIVE_FAILURES ? BACKOFF_DELAY_MS : RETRY_DELAY_MS);
         }
       }
     } finally {
       shutdown.dispose();
+      this.inboundDrainStopped = true;
       this.clearPendingImageInboundTimers();
       await this.closeLocationServer();
       await this.runtimeAdapter.close();
@@ -322,8 +359,38 @@ class CyberbossApp {
     }, {});
   }
 
+  kickInboundDrain() {
+    if (this.inboundDrainStopped || this.inboundDrainPromise || !this.durableInboundQueue.pendingCount) {
+      return;
+    }
+    const runner = async () => {
+      let failures = 0;
+      while (!this.inboundDrainStopped && this.durableInboundQueue.pendingCount > 0) {
+        const job = this.durableInboundQueue.peek();
+        if (!job) break;
+        try {
+          await this.handleIncomingMessage(job.raw);
+          // An item is acknowledged only after processing successfully returns.
+          this.durableInboundQueue.ack(job.key);
+          failures = 0;
+        } catch (error) {
+          failures += 1;
+          console.error(
+            `[cyberboss] inbound spool handler failed; keeping local job for retry count=${failures} code=${error?.code || error?.name || "ERROR"}`
+          );
+          await sleep(Math.min(30_000, 1_000 * 2 ** Math.min(failures, 5)));
+        }
+      }
+    };
+    this.inboundDrainPromise = runner().catch((error) => {
+      console.error(`[cyberboss] inbound spool drain failed: ${formatErrorMessage(error)}`);
+    }).finally(() => {
+      this.inboundDrainPromise = null;
+    });
+  }
+
   async handleIncomingMessage(message) {
-    const normalized = this.channelAdapter.normalizeIncomingMessage(message);
+    const normalized = this.channelAdapter.normalizeIncomingMessage(message, { skipDedup: true });
     if (!normalized) {
       return;
     }
@@ -409,7 +476,11 @@ class CyberbossApp {
       await this.flushPendingImageInboundBatch({ bindingKey, workspaceRoot });
     }
 
-    await this.routePreparedInbound({ bindingKey, workspaceRoot, prepared });
+    const accepted = await this.routePreparedInbound({ bindingKey, workspaceRoot, prepared });
+    if (!accepted) {
+      // Preserve the raw message in the durable spool for retry.
+      throw new Error("Codex did not accept the incoming turn; retaining inbound spool item");
+    }
   }
 
   isTurnDispatchBlocked(bindingKey, workspaceRoot, { ignoreBoundary = false } = {}) {
@@ -513,8 +584,9 @@ class CyberbossApp {
 
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
+      // The prepared turn is already persisted to disk by this method.
       this.bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared });
-      return false;
+      return true;
     }
     return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
   }
@@ -525,18 +597,24 @@ class CyberbossApp {
 
   enqueuePendingImageInbound({ bindingKey, workspaceRoot, prepared }) {
     const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
-    if (!scopeKey || !prepared) {
-      return;
-    }
+    if (!scopeKey || !prepared) return;
 
-    const current = this.pendingImageInboundByScope.get(scopeKey) || {
+    const previous = this.pendingImageInboundByScope.get(scopeKey) || null;
+    const draft = {
       bindingKey,
       workspaceRoot,
-      messages: [],
-      timer: null,
+      messages: [...(previous?.messages || []), clonePreparedInboundMessage(prepared)],
+      timer: previous?.timer || null,
     };
-    current.messages.push(clonePreparedInboundMessage(prepared));
-    this.pendingImageInboundByScope.set(scopeKey, current);
+    this.pendingImageInboundByScope.set(scopeKey, draft);
+    try {
+      // Save pending debounced images before the durable raw message is acknowledged.
+      this.pendingImageBatchStore.save(this.pendingImageInboundByScope);
+    } catch (error) {
+      if (previous) this.pendingImageInboundByScope.set(scopeKey, previous);
+      else this.pendingImageInboundByScope.delete(scopeKey);
+      throw error;
+    }
     this.schedulePendingImageInboundFlush(scopeKey, bindingKey, workspaceRoot);
     void this.channelAdapter.sendTyping({
       userId: prepared.senderId,
@@ -579,61 +657,68 @@ class CyberbossApp {
 
   async flushPendingImageInboundBatch({ bindingKey = "", workspaceRoot = "", trailingPrepared = null } = {}) {
     const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
-    const draft = scopeKey ? this.pendingImageInboundByScope.get(scopeKey) || null : null;
-    if (!draft?.bindingKey || !draft?.workspaceRoot) {
-      if (scopeKey) {
+    if (!scopeKey || this.pendingImageFlushScopes.has(scopeKey)) return false;
+    const draft = this.pendingImageInboundByScope.get(scopeKey);
+    if (!draft?.bindingKey || !draft?.workspaceRoot) return false;
+
+    this.pendingImageFlushScopes.add(scopeKey);
+    try {
+      this.clearPendingImageInboundTimer(scopeKey);
+      const queued = (Array.isArray(draft.messages) ? draft.messages : [])
+        .filter((message) => message && typeof message === "object")
+        .slice().sort(comparePendingInboundMessages);
+      if (!queued.length) {
+        this.pendingImageInboundByScope.delete(scopeKey);
+        this.pendingImageBatchStore.save(this.pendingImageInboundByScope);
+        return false;
+      }
+      if (this.isTurnDispatchBlocked(draft.bindingKey, draft.workspaceRoot)) {
+        this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot);
+        return false;
+      }
+
+      const { batchMessages, remainingMessages } = takeImageOnlyBatchMessages(
+        queued, MAX_INBOUND_STICKER_IMAGE_BATCH
+      );
+      if (!batchMessages.length) return false;
+      const prepared = buildMergedInboundPrepared({
+        bindingKey: draft.bindingKey,
+        workspaceRoot: draft.workspaceRoot,
+        messages: batchMessages,
+        trailingPrepared,
+      });
+      const dispatched = await this.dispatchPreparedTurn({
+        bindingKey: draft.bindingKey,
+        workspaceRoot: draft.workspaceRoot,
+        prepared,
+      });
+      if (!dispatched) {
+        this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot);
+        return false;
+      }
+      // New images may arrive while sendTurn is pending. Preserve those newer entries;
+      // otherwise a concurrent append would be silently dropped when replacing the draft.
+      const latest = this.pendingImageInboundByScope.get(scopeKey);
+      const newArrivals = (latest?.messages || []).slice(draft.messages.length);
+      const unprocessed = [...remainingMessages, ...newArrivals];
+      if (unprocessed.length) {
+        this.pendingImageInboundByScope.set(scopeKey, {
+          bindingKey: draft.bindingKey,
+          workspaceRoot: draft.workspaceRoot,
+          messages: unprocessed,
+          timer: latest?.timer || null,
+        });
+      } else {
         this.pendingImageInboundByScope.delete(scopeKey);
       }
-      return false;
+      this.pendingImageBatchStore.save(this.pendingImageInboundByScope);
+      if (unprocessed.length) {
+        this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot, 100);
+      }
+      return true;
+    } finally {
+      this.pendingImageFlushScopes.delete(scopeKey);
     }
-
-    this.clearPendingImageInboundTimer(scopeKey);
-    this.pendingImageInboundByScope.delete(scopeKey);
-
-    const queued = Array.isArray(draft.messages)
-      ? draft.messages
-        .filter((message) => message && typeof message === "object")
-        .slice()
-        .sort(comparePendingInboundMessages)
-      : [];
-    if (!queued.length) {
-      return false;
-    }
-
-    const { batchMessages, remainingMessages } = takeImageOnlyBatchMessages(queued, MAX_INBOUND_STICKER_IMAGE_BATCH);
-    if (!batchMessages.length) {
-      return false;
-    }
-
-    if (remainingMessages.length) {
-      this.pendingImageInboundByScope.set(scopeKey, {
-        bindingKey: draft.bindingKey,
-        workspaceRoot: draft.workspaceRoot,
-        messages: remainingMessages,
-        timer: null,
-      });
-    }
-
-    const prepared = buildMergedInboundPrepared({
-      bindingKey: draft.bindingKey,
-      workspaceRoot: draft.workspaceRoot,
-      messages: batchMessages,
-      trailingPrepared,
-    });
-    await this.routePreparedInbound({
-      bindingKey: draft.bindingKey,
-      workspaceRoot: draft.workspaceRoot,
-      prepared,
-    });
-
-    if (remainingMessages.length) {
-      await this.flushPendingImageInboundBatch({
-        bindingKey: draft.bindingKey,
-        workspaceRoot: draft.workspaceRoot,
-      });
-    }
-
-    return true;
   }
 
   bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared }) {
@@ -642,12 +727,8 @@ class CyberbossApp {
       return;
     }
 
-    const current = this.pendingInboundByScope.get(scopeKey) || {
-      bindingKey,
-      workspaceRoot,
-      messages: [],
-    };
-    current.messages.push({
+    const oldDraft = this.pendingInboundByScope.get(scopeKey) || null;
+    const entry = {
       workspaceId: prepared.workspaceId,
       accountId: prepared.accountId,
       senderId: prepared.senderId,
@@ -659,8 +740,19 @@ class CyberbossApp {
       attachments: Array.isArray(prepared.attachments) ? prepared.attachments : [],
       attachmentFailures: Array.isArray(prepared.attachmentFailures) ? prepared.attachmentFailures : [],
       receivedAt: prepared.receivedAt,
+    };
+    this.pendingInboundByScope.set(scopeKey, {
+      bindingKey,
+      workspaceRoot,
+      messages: [...(oldDraft?.messages || []), entry],
     });
-    this.pendingInboundByScope.set(scopeKey, current);
+    try {
+      this.pendingTurnBatchStore.save(this.pendingInboundByScope);
+    } catch (error) {
+      if (oldDraft) this.pendingInboundByScope.set(scopeKey, oldDraft);
+      else this.pendingInboundByScope.delete(scopeKey);
+      throw error;
+    }
     void this.channelAdapter.sendTyping({
       userId: prepared.senderId,
       status: 1,
@@ -679,45 +771,53 @@ class CyberbossApp {
       : [...this.pendingInboundByScope.entries()];
 
     for (const [scopeKey, draft] of scopeEntries) {
-      if (!draft?.bindingKey || !draft?.workspaceRoot) {
-        this.pendingInboundByScope.delete(scopeKey);
-        continue;
-      }
+      if (this.pendingTurnFlushScopes.has(scopeKey)) continue;
+      if (!draft?.bindingKey || !draft?.workspaceRoot) continue;
       if (this.isTurnDispatchBlocked(draft.bindingKey, draft.workspaceRoot, { ignoreBoundary })) {
         continue;
       }
-      const pendingDispatch = this.mergePendingInboundDraft(draft);
-      if (!pendingDispatch?.prepared) {
-        this.pendingInboundByScope.delete(scopeKey);
-        continue;
-      }
-      this.pendingInboundByScope.delete(scopeKey);
-      const dispatched = await this.dispatchPreparedTurn({
-        bindingKey: pendingDispatch.prepared.bindingKey,
-        workspaceRoot: pendingDispatch.prepared.workspaceRoot,
-        prepared: {
-          workspaceId: pendingDispatch.prepared.workspaceId,
-          accountId: pendingDispatch.prepared.accountId,
-          senderId: pendingDispatch.prepared.senderId,
-          contextToken: pendingDispatch.prepared.contextToken,
-          provider: pendingDispatch.prepared.provider,
-          originalText: pendingDispatch.prepared.originalText,
-          text: pendingDispatch.prepared.text,
-          attachments: pendingDispatch.prepared.attachments,
-          attachmentFailures: pendingDispatch.prepared.attachmentFailures,
-          receivedAt: pendingDispatch.prepared.receivedAt,
-        },
-      });
-      if (!dispatched) {
-        this.pendingInboundByScope.set(scopeKey, draft);
-        continue;
-      }
-      if (pendingDispatch.remainingMessages.length) {
-        this.pendingInboundByScope.set(scopeKey, {
-          bindingKey: draft.bindingKey,
-          workspaceRoot: draft.workspaceRoot,
-          messages: pendingDispatch.remainingMessages,
+      this.pendingTurnFlushScopes.add(scopeKey);
+      try {
+        const pendingDispatch = this.mergePendingInboundDraft(draft);
+        if (!pendingDispatch?.prepared) {
+          this.pendingInboundByScope.delete(scopeKey);
+          this.pendingTurnBatchStore.save(this.pendingInboundByScope);
+          continue;
+        }
+        // Leave the durable snapshot intact until Codex accepts the turn.
+        const dispatched = await this.dispatchPreparedTurn({
+          bindingKey: pendingDispatch.prepared.bindingKey,
+          workspaceRoot: pendingDispatch.prepared.workspaceRoot,
+          prepared: {
+            workspaceId: pendingDispatch.prepared.workspaceId,
+            accountId: pendingDispatch.prepared.accountId,
+            senderId: pendingDispatch.prepared.senderId,
+            contextToken: pendingDispatch.prepared.contextToken,
+            provider: pendingDispatch.prepared.provider,
+            originalText: pendingDispatch.prepared.originalText,
+            text: pendingDispatch.prepared.text,
+            attachments: pendingDispatch.prepared.attachments,
+            attachmentFailures: pendingDispatch.prepared.attachmentFailures,
+            receivedAt: pendingDispatch.prepared.receivedAt,
+          },
         });
+        if (!dispatched) continue;
+        // Preserve messages appended while the previous batch was in flight.
+        const latest = this.pendingInboundByScope.get(scopeKey);
+        const newArrivals = (latest?.messages || []).slice(draft.messages.length);
+        const unprocessed = [...pendingDispatch.remainingMessages, ...newArrivals];
+        if (unprocessed.length) {
+          this.pendingInboundByScope.set(scopeKey, {
+            bindingKey: draft.bindingKey,
+            workspaceRoot: draft.workspaceRoot,
+            messages: unprocessed,
+          });
+        } else {
+          this.pendingInboundByScope.delete(scopeKey);
+        }
+        this.pendingTurnBatchStore.save(this.pendingInboundByScope);
+      } finally {
+        this.pendingTurnFlushScopes.delete(scopeKey);
       }
     }
   }
