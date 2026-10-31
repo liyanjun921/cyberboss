@@ -3,6 +3,7 @@ const {
   STICKER_DESC_GUIDANCE,
   STICKER_DESC_FIELD_DESCRIPTION,
   STICKER_TAG_GUIDANCE,
+  STICKER_TAG_SEARCH_GUIDANCE,
 } = require("../services/sticker-service");
 
 class ProjectToolHost {
@@ -163,7 +164,7 @@ const PROJECT_TOOLS = [
   },
   {
     name: "cyberboss_sticker_tags",
-    description: `Load the current sticker tag catalog and tagging rules only when you have decided a sticker is needed or an inbox image should be saved as a sticker. ${STICKER_TAG_GUIDANCE}`,
+    description: `Load the sticker tag catalog, real asset availability counts, and explicit Chinese/English aliases only when you need to select or save a sticker. ${STICKER_TAG_GUIDANCE} ${STICKER_TAG_SEARCH_GUIDANCE}`,
     shortHint: "Load sticker tags only when needed.",
     topics: ["sticker"],
     inputSchema: {
@@ -181,14 +182,14 @@ const PROJECT_TOOLS = [
   },
   {
     name: "cyberboss_sticker_pick",
-    description: "List a few saved sticker candidates for one sticker tag after you have decided a sticker would help.",
+    description: `List saved sticker candidates by exact tag or an explicit Chinese/English alias. No semantic fallback is used. An empty candidate list means there is no matching saved sticker; do not substitute another image. ${STICKER_TAG_SEARCH_GUIDANCE}`,
     shortHint: "Pick sticker candidates by tag.",
     topics: ["sticker"],
     inputSchema: {
       type: "object",
       required: ["tag"],
       properties: {
-        tag: { type: "string", description: "Sticker tag such as 可爱, 无语, 躺平, 感动, or OK." },
+        tag: { type: "string", description: "Sticker tag or explicit alias, e.g. 晚安/good night, 亲亲/kiss, 抱抱/hug, or 想你/miss you." },
         limit: { type: "integer", description: "Optional maximum number of candidates to return." },
       },
       additionalProperties: false,
@@ -196,7 +197,9 @@ const PROJECT_TOOLS = [
     async handler({ services, args }) {
       const result = await services.sticker.pick(args);
       return {
-        text: `Sticker candidates loaded: ${result.candidates.length}.`,
+        text: result.candidates.length
+          ? `Sticker candidates loaded: ${result.candidates.length} for ${result.tag}.`
+          : `No saved sticker candidates for "${result.query}" (resolved tag: ${result.tag}). Do not send a substitute.`,
         data: result,
       };
     },
