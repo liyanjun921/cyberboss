@@ -17,6 +17,13 @@ const MAX_STICKER_SAVE_BATCH_SIZE = 10;
 const MAX_STICKER_MUTATION_BATCH_SIZE = 50;
 const MIN_STICKER_DESC_CHARS = 16;
 const STICKER_TAG_GUIDANCE = "Reuse existing tags when they fit. Otherwise create short new tags; new tags are added to the tag list.";
+const STICKER_TAG_ALIASES = Object.freeze({
+  "亲亲": ["亲吻", "亲嘴", "啵啵", "么么", "kiss", "kissing", "kiss kiss", "muah"],
+  "抱抱": ["拥抱", "抱一抱", "hug", "hugs", "hugging", "cuddle", "cuddles"],
+  "想你": ["想念", "思念", "miss you", "missing you", "miss u", "miss ya"],
+  "晚安": ["good night", "goodnight", "night night", "sleep well", "晚安安"],
+});
+const STICKER_TAG_SEARCH_GUIDANCE = "The tag catalog can contain categories with no saved images. Only tags in availableTags currently have image files; check tagCounts before selecting. Explicit Chinese/English aliases are supported, but matching remains tag-based with no semantic fallback. If candidates is empty, do not send a substitute.";
 const STICKER_DESC_GUIDANCE = `Prefer descs of ${MIN_STICKER_DESC_CHARS} or more characters. If readable text exists, append it after the short scene description.`;
 const STICKER_DESC_FIELD_DESCRIPTION = `A concrete sticker description. ${STICKER_DESC_GUIDANCE}`;
 
@@ -30,9 +37,33 @@ class StickerService {
 
   async listTags() {
     ensureStickerCatalogFilesSync(this.config);
+    const index = loadStickerIndexSync(this.config);
+    const tagCounts = {};
+    let stickerCount = 0;
+    for (const [stickerId, entry] of Object.entries(index)) {
+      if (!fs.existsSync(resolveStickerFilePath(this.config, stickerId))) {
+        continue;
+      }
+      stickerCount += 1;
+      for (const tag of Array.isArray(entry?.tags) ? entry.tags : []) {
+        tagCounts[tag] = (tagCounts[tag] || 0) + 1;
+      }
+    }
+    const tags = mergeStickerTagCatalog(
+      mergeStickerTagCatalog(loadStickerTagsSync(this.config), Object.keys(STICKER_TAG_ALIASES)),
+      Object.keys(tagCounts),
+    );
+    const availableTags = Object.keys(tagCounts).sort();
+    const emptyTags = tags.filter((tag) => !tagCounts[tag]);
     return {
-      tags: loadStickerTagsSync(this.config),
-      guidance: `Choose 1-3 short tags. ${STICKER_TAG_GUIDANCE} Make desc concrete enough to identify the sticker. ${STICKER_DESC_GUIDANCE}`,
+      tags,
+      availableTags,
+      availableTagCount: availableTags.length,
+      emptyTags,
+      tagCounts,
+      stickerCount,
+      aliases: STICKER_TAG_ALIASES,
+      guidance: `Choose 1-3 short tags. ${STICKER_TAG_GUIDANCE} ${STICKER_TAG_SEARCH_GUIDANCE} Make desc concrete enough to identify the sticker. ${STICKER_DESC_GUIDANCE}`,
     };
   }
 
@@ -89,25 +120,32 @@ class StickerService {
 
   async pick({ tag = "", limit = DEFAULT_PICK_LIMIT } = {}) {
     ensureStickerCatalogFilesSync(this.config);
-    const normalizedTag = normalizeText(tag);
-    if (!normalizedTag) {
+    const query = normalizeText(tag);
+    if (!query) {
       throw new Error("Sticker tag is required.");
     }
+    const tagCatalog = mergeStickerTagCatalog(loadStickerTagsSync(this.config), Object.keys(STICKER_TAG_ALIASES));
+    const resolution = resolveStickerTag(query, tagCatalog);
+    const normalizedTag = resolution.tag;
     const normalizedLimit = normalizePickLimit(limit);
     const index = loadStickerIndexSync(this.config);
     const entries = Object.entries(index)
       .filter(([stickerId, value]) => Array.isArray(value?.tags)
-        && value.tags.includes(normalizedTag)
+        && value.tags.some((item) => normalizeStickerLookupText(item) === normalizeStickerLookupText(normalizedTag))
         && fs.existsSync(resolveStickerFilePath(this.config, stickerId)))
       .slice(-normalizedLimit)
       .reverse()
       .map(([stickerId, value]) => ({
         stickerId,
+        tags: Array.isArray(value?.tags) ? value.tags : [],
         desc: normalizeText(value?.desc),
       }));
 
     return {
+      query,
       tag: normalizedTag,
+      matchedAlias: resolution.matchedAlias,
+      available: entries.length > 0,
       candidates: entries,
     };
   }
@@ -259,15 +297,47 @@ function buildStickerPaths(config = {}) {
 function ensureStickerCatalogFilesSync(config = {}) {
   const paths = buildStickerPaths(config);
   if (fs.existsSync(paths.stickersDir)) {
+    migrateLegacyStickerMetadataSync(paths);
     return;
   }
   if (paths.stickersTemplateDir && fs.existsSync(paths.stickersTemplateDir)) {
     fs.cpSync(paths.stickersTemplateDir, paths.stickersDir, { recursive: true });
+    migrateLegacyStickerMetadataSync(paths);
     return;
   }
   fs.mkdirSync(paths.stickerAssetsDir, { recursive: true });
   writeJsonFileSync(paths.stickersIndexFile, {});
   writeJsonFileSync(paths.stickerTagsFile, []);
+  migrateLegacyStickerMetadataSync(paths);
+}
+
+function migrateLegacyStickerMetadataSync(paths = {}) {
+  const indexFile = paths.stickersIndexFile;
+  if (!indexFile || !fs.existsSync(indexFile)) {
+    return false;
+  }
+  try {
+    const index = JSON.parse(fs.readFileSync(indexFile, "utf8"));
+    const entry = index?.stk_009;
+    const tags = Array.isArray(entry?.tags) ? entry.tags.map((tag) => normalizeText(tag)) : [];
+    const desc = normalizeText(entry?.desc);
+    const isKnownGoodNightCat = tags.includes("抱抱")
+      && desc.includes("小猫")
+      && desc.includes("枕头")
+      && /good\s*night/i.test(desc);
+    if (!isKnownGoodNightCat) {
+      return false;
+    }
+    entry.tags = tags.filter((tag) => tag !== "抱抱");
+    if (!entry.tags.length) {
+      entry.tags = ["晚安"];
+    }
+    entry.desc = "抱着枕头和小熊的小猫，画面带有 good night 字样，适合晚安场景";
+    writeJsonFileSync(indexFile, index);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 function loadStickerIndexSync(config = {}) {
@@ -355,6 +425,30 @@ function normalizePickLimit(limit) {
     return DEFAULT_PICK_LIMIT;
   }
   return Math.max(1, Math.min(MAX_PICK_LIMIT, limit));
+}
+
+function normalizeStickerLookupText(value) {
+  return normalizeText(value)
+    .normalize("NFKC")
+    .toLocaleLowerCase("en-US")
+    .replace(/[\s\u3000]+/g, " ");
+}
+
+function resolveStickerTag(query, catalogTags = []) {
+  const normalizedQuery = normalizeStickerLookupText(query);
+  const directTag = catalogTags.find((tag) => normalizeStickerLookupText(tag) === normalizedQuery);
+  if (directTag) {
+    return { tag: directTag, matchedAlias: false };
+  }
+  for (const [canonicalTag, aliases] of Object.entries(STICKER_TAG_ALIASES)) {
+    if (normalizeStickerLookupText(canonicalTag) === normalizedQuery) {
+      return { tag: canonicalTag, matchedAlias: false };
+    }
+    if (aliases.some((alias) => normalizeStickerLookupText(alias) === normalizedQuery)) {
+      return { tag: canonicalTag, matchedAlias: true };
+    }
+  }
+  return { tag: normalizeText(query), matchedAlias: false };
 }
 
 function allocateNextStickerId(index = {}) {
@@ -638,6 +732,8 @@ module.exports = {
   DEFAULT_PICK_LIMIT,
   MIN_STICKER_DESC_CHARS,
   STICKER_TAG_GUIDANCE,
+  STICKER_TAG_ALIASES,
+  STICKER_TAG_SEARCH_GUIDANCE,
   STICKER_DESC_GUIDANCE,
   STICKER_DESC_FIELD_DESCRIPTION,
   StickerService,

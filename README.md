@@ -426,7 +426,8 @@ This is the runtime state directory, not your project workspace. The WeChat thre
 - On the current WeChat bridge path, do not rely on animated playback for inbound or outbound stickers. A GIF may still show up as a static image in chat.
 - Because of that, saved stickers are currently normalized to GIF at intake so the asset format is already aligned if WeChat later opens a fuller sticker capability.
 - The tag catalog lives at `${HOME}/.cyberboss/stickers/tags.json`. The AI reads from it, and users can edit it directly.
-- For now, sticker retrieval is tag-filtered only. There is no vector-database recall layer.
+- Sticker retrieval remains tag-filtered (there is no vector-database recall layer) and supports a small, explicit Chinese/English alias map.
+- The tag catalog may include empty categories. Use `availableTags` and `tagCounts` returned by `cyberboss_sticker_tags` to see which tags currently have saved image files. An empty candidate list means no matching sticker exists; do not substitute a semantically unrelated image.
 
 <a id="agent-guide"></a>
 ## Agent Guide
