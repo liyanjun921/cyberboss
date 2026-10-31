@@ -31,7 +31,8 @@ jobs:
           node --check src/core/app.js
           node --check test/sticker-batch-isolation.test.js
           node --check test/media-intake-isolation.test.js
-          node --check test/image-batching.test.js
+          node --check test/image-batching.test.js test/outbound-file-policy.test.js
+          node --check test/outbound-file-policy.test.js
       - name: Check all Cyberboss source files
         run: npm run check
       - name: Run isolated regression tests
