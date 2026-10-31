@@ -33,7 +33,10 @@ jobs:
           node --check test/media-intake-isolation.test.js
           node --check test/image-batching.test.js
           node --check test/outbound-file-policy.test.js
+          node --check src/core/durable-inbound-queue.js
+          node --check test/durable-inbound-queue.test.js
+          node --check test/inbound-filter-retry.test.js
       - name: Check all Cyberboss source files
         run: npm run check
       - name: Run isolated regression tests
-        run: node --test test/sticker-batch-isolation.test.js test/media-intake-isolation.test.js test/image-batching.test.js test/outbound-file-policy.test.js
+        run: node --test test/sticker-batch-isolation.test.js test/media-intake-isolation.test.js test/image-batching.test.js test/outbound-file-policy.test.js test/durable-inbound-queue.test.js test/inbound-filter-retry.test.js
