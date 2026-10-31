@@ -175,7 +175,7 @@ const PROJECT_TOOLS = [
     async handler({ services }) {
       const result = await services.sticker.listTags();
       return {
-        text: `Sticker tags loaded: ${Array.isArray(result.tags) ? result.tags.length : 0}.`,
+        text: `Sticker catalog loaded: ${result.tags.length} categories, ${result.stickerCount} saved stickers, ${result.availableTagCount} categories with assets.`,
         data: result,
       };
     },
