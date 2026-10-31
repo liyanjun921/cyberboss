@@ -1,3 +1,24 @@
+# 2026-10-31｜第二轮修复验收：后台媒体队列与文件发送权限
+
+GitHub Actions 运行 **41167073846**：**success**，`npm run check` 通过，`node --test` **24/24 PASS，0 FAIL**。此结果是 GitHub Node 22 隔离测试，不是 Windows 上微信端真实验收。
+
+## 本轮追加
+- `src/services/outbound-file-policy.js` + `channel-file-service.js`：发送文件前执行绝对路径和真实路径校验，默认只允许 `stateDir/stickers/assets`、`stateDir/inbox`、`workspaceRoot/exports`、`out`、`generated`，拦截常见凭据文件名及符号链接越界。此保护不等于内容防泄漏扫描，需在正式环境检查隐私政策。
+- `src/core/durable-inbound-queue.js` + `src/adapters/channel/weixin/index.js` + `src/core/app.js`：`getUpdates` 获取后**先在本地持久化原始微信更新，再保存 syncBuffer 游标**，后台顺序处理并在成功返回后确认消息；程序退出后可从本地继续处理；上限 500 项，满额拒绝推进游标。
+- `src/adapters/channel/weixin/message-utils.js`：队列重试绕过易提前标记已读的内存去重，但保留持久队列的 replay 去重。
+- `src/core/persistent-image-batch-store.js` + `app.js`：把等待合批的图片列表原子写本地，启动恢复，发给 Codex 被接受后才清理；图片在异步发送期间新到达会被保留。
+- 新增队列恢复、重复入队、队列溢出、损坏数据拒绝、路径越界、凭据名和 symlink 拒绝、图片合批恢复测试。
+
+## 重要限制（不得视为已上线）
+- 尚未在用户 Windows 本机运行，**目前仅测试分支**；共享记忆和统一管理器仍在原版运行。
+- 当前队列提供 **at-least-once** 恢复语义；如果远端 Codex 已收到请求、而本地确认前恰好崩溃，少数消息可能重复。没有承诺 exactly-once。
+- 原始微信更新在本地 `stateDir/inbound-spool.json` 落盘直到确认，图片批次在 `stateDir/pending-image-batches.json` 落盘；含用户聊天内容，切勿放入 Git 仓库、日志或上传私有/公共记忆库。
+- 某些异步内存缓冲（如等待 Codex 当前轮结束的普通文本）、真实系统权限行为、异常重试/多线程时序、文件内容分类防泄露、Crash 中断全流程仍需要额外实机验证。
+- 在 Windows 本机部署前必须先对当前**独立启动器源码**备份、比较差异；复用统一管理器，不关闭共享 Codex 和记忆库；保留回滚。
+- 仍欠缺真正的端到端微信测试：单图、多图、动图去重、连续发送、长时间网络断续、独立权限、重启后待处理消息验收。
+
+---
+
 # Cyberboss 媒体与表情包修复｜分支验收记录（2026-10-31）
 
 依据用户18页《Cyberboss 完整升级、修复与验收任务书》开发。本文件记录**GitHub 分支源码**而非用户 Windows 运行状态。
