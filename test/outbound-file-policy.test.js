@@ -53,7 +53,15 @@ test("outbound sending denies symlinks pointing from export to private directory
   const f = await fixture(t);
   const target = await f.make(path.join(f.privateDir, "personal.md"));
   const link = path.join(f.exportsDir, "shortcut.md");
-  await fsp.symlink(target, link);
+  try {
+    await fsp.symlink(target, link);
+  } catch (error) {
+    if (process.platform === "win32" && (error?.code === "EPERM" || error?.code === "EACCES")) {
+      t.skip("Windows account does not have permission to create a symbolic link; path restriction tests still run");
+      return;
+    }
+    throw error;
+  }
   assert.throws(() => validateOutboundFile(link, f.config), /outside the approved/);
 });
 
