@@ -107,7 +107,7 @@ test("marks and preserves the Garden reason and server message", () => {
     message: "游戏轮到你了，请读取当前状态。",
   });
 
-  assert.match(text, new RegExp(GARDEN_WAKE_MARKER));
+  assert.ok(text.includes(GARDEN_WAKE_MARKER));
   assert.match(text, /reason: game_turn_required/);
   assert.match(text, /游戏轮到你了，请读取当前状态。/);
 });
