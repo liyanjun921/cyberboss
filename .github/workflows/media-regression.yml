@@ -17,13 +17,23 @@ permissions:
 
 jobs:
   regression:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            node: "22"
+          - os: windows-latest
+            node: "22"
+          - os: windows-latest
+            node: "26"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 12
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: ${{ matrix.node }}
       - name: Install declared dependencies for integration tests
         run: npm ci --ignore-scripts --no-audit --no-fund
       - name: Check syntax
