@@ -83,10 +83,8 @@ function loadCyberbossEnvironment(env = process.env) {
     }
   }
 
-  const stateDir = normalizeText(env.CYBERBOSS_STATE_DIR);
-  if (!stateDir) {
-    throw new Error("Set GARDEN_CYBERBOSS_STATE_DIR or CYBERBOSS_STATE_DIR to the existing Cyberboss state directory");
-  }
+  const stateDir = normalizeText(env.CYBERBOSS_STATE_DIR)
+    || path.join(os.homedir(), ".cyberboss");
   if (!path.isAbsolute(stateDir)) {
     throw new Error("Cyberboss state directory must be an absolute path");
   }
@@ -232,7 +230,14 @@ async function main() {
   const { SessionStore } = require("../../src/adapters/runtime/codex/session-store");
   const { SystemMessageService } = require("../../src/services/system-message-service");
 
-  const config = readConfig();
+  const originalArgv = process.argv;
+  let config;
+  try {
+    process.argv = [process.execPath, __filename];
+    config = readConfig();
+  } finally {
+    process.argv = originalArgv;
+  }
   const sessionStore = new SessionStore({
     filePath: config.sessionsFile,
     runtimeId: config.runtime || "codex",
