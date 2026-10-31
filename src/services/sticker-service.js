@@ -38,23 +38,30 @@ class StickerService {
   async listTags() {
     ensureStickerCatalogFilesSync(this.config);
     const index = loadStickerIndexSync(this.config);
-    const tags = mergeStickerTagCatalog(loadStickerTagsSync(this.config), Object.keys(STICKER_TAG_ALIASES));
     const tagCounts = {};
+    let stickerCount = 0;
     for (const [stickerId, entry] of Object.entries(index)) {
       if (!fs.existsSync(resolveStickerFilePath(this.config, stickerId))) {
         continue;
       }
+      stickerCount += 1;
       for (const tag of Array.isArray(entry?.tags) ? entry.tags : []) {
         tagCounts[tag] = (tagCounts[tag] || 0) + 1;
       }
     }
+    const tags = mergeStickerTagCatalog(
+      mergeStickerTagCatalog(loadStickerTagsSync(this.config), Object.keys(STICKER_TAG_ALIASES)),
+      Object.keys(tagCounts),
+    );
     const availableTags = Object.keys(tagCounts).sort();
     const emptyTags = tags.filter((tag) => !tagCounts[tag]);
     return {
       tags,
       availableTags,
+      availableTagCount: availableTags.length,
       emptyTags,
       tagCounts,
+      stickerCount,
       aliases: STICKER_TAG_ALIASES,
       guidance: `Choose 1-3 short tags. ${STICKER_TAG_GUIDANCE} ${STICKER_TAG_SEARCH_GUIDANCE} Make desc concrete enough to identify the sticker. ${STICKER_DESC_GUIDANCE}`,
     };
