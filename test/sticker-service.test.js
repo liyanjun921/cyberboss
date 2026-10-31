@@ -307,6 +307,9 @@ test("sticker retrieval resolves explicit aliases, reports real availability, an
   assert.equal(catalog.emptyTags.includes("亲亲"), true);
   assert.equal(catalog.emptyTags.includes("想你"), true);
   assert.equal(catalog.tagCounts["晚安"], 1);
+  assert.equal(catalog.stickerCount, 2);
+  assert.equal(catalog.availableTagCount, catalog.availableTags.length);
+  assert.equal(catalog.tags.includes("爱"), true);
 
   const migrated = loadStickerIndexSync(config).stk_009;
   assert.deepEqual(migrated.tags, ["晚安", "可爱"]);
