@@ -6,6 +6,7 @@ const { createWeixinChannelAdapter } = require("../adapters/channel/weixin");
 const { DEFAULT_MIN_WEIXIN_CHUNK, MAX_MIN_WEIXIN_CHUNK } = require("../adapters/channel/weixin/config-store");
 const { persistIncomingWeixinAttachments } = require("../adapters/channel/weixin/media-receive");
 const { DurableInboundQueue } = require("./durable-inbound-queue");
+const { PersistentImageBatchStore } = require("./persistent-image-batch-store");
 const { createCodexRuntimeAdapter } = require("../adapters/runtime/codex");
 const { createClaudeCodeRuntimeAdapter } = require("../adapters/runtime/claudecode");
 const { findModelByQuery } = require("../adapters/runtime/codex/model-catalog");
@@ -90,7 +91,11 @@ class CyberbossApp {
     });
     this.inboundDrainPromise = null;
     this.inboundDrainStopped = false;
-    this.pendingImageInboundByScope = new Map();
+    this.pendingImageBatchStore = new PersistentImageBatchStore({
+      filePath: path.join(config.stateDir, "pending-image-batches.json"),
+    });
+    this.pendingImageInboundByScope = new Map(this.pendingImageBatchStore.load());
+    this.pendingImageFlushScopes = new Set();
     this.turnBoundaryScopeKeys = new Set();
     this.systemMessageDispatcher = null;
     this.streamDelivery = new StreamDelivery({
@@ -177,6 +182,10 @@ class CyberbossApp {
       let consecutiveFailures = 0;
       // Recover work persisted before a previous crash, before receiving newer updates.
       this.kickInboundDrain();
+      // Flush previously staged image batches after a process restart.
+      for (const [scopeKey, draft] of this.pendingImageInboundByScope.entries()) {
+        this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot, 100);
+      }
       while (!shutdown.stopped) {
         try {
           await Promise.all([
@@ -574,18 +583,24 @@ class CyberbossApp {
 
   enqueuePendingImageInbound({ bindingKey, workspaceRoot, prepared }) {
     const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
-    if (!scopeKey || !prepared) {
-      return;
-    }
+    if (!scopeKey || !prepared) return;
 
-    const current = this.pendingImageInboundByScope.get(scopeKey) || {
+    const previous = this.pendingImageInboundByScope.get(scopeKey) || null;
+    const draft = {
       bindingKey,
       workspaceRoot,
-      messages: [],
-      timer: null,
+      messages: [...(previous?.messages || []), clonePreparedInboundMessage(prepared)],
+      timer: previous?.timer || null,
     };
-    current.messages.push(clonePreparedInboundMessage(prepared));
-    this.pendingImageInboundByScope.set(scopeKey, current);
+    this.pendingImageInboundByScope.set(scopeKey, draft);
+    try {
+      // Save pending debounced images before the durable raw message is acknowledged.
+      this.pendingImageBatchStore.save(this.pendingImageInboundByScope);
+    } catch (error) {
+      if (previous) this.pendingImageInboundByScope.set(scopeKey, previous);
+      else this.pendingImageInboundByScope.delete(scopeKey);
+      throw error;
+    }
     this.schedulePendingImageInboundFlush(scopeKey, bindingKey, workspaceRoot);
     void this.channelAdapter.sendTyping({
       userId: prepared.senderId,
@@ -628,61 +643,64 @@ class CyberbossApp {
 
   async flushPendingImageInboundBatch({ bindingKey = "", workspaceRoot = "", trailingPrepared = null } = {}) {
     const scopeKey = buildScopeKey(bindingKey, workspaceRoot);
-    const draft = scopeKey ? this.pendingImageInboundByScope.get(scopeKey) || null : null;
-    if (!draft?.bindingKey || !draft?.workspaceRoot) {
-      if (scopeKey) {
+    if (!scopeKey || this.pendingImageFlushScopes.has(scopeKey)) return false;
+    const draft = this.pendingImageInboundByScope.get(scopeKey);
+    if (!draft?.bindingKey || !draft?.workspaceRoot) return false;
+
+    this.pendingImageFlushScopes.add(scopeKey);
+    try {
+      this.clearPendingImageInboundTimer(scopeKey);
+      const queued = (Array.isArray(draft.messages) ? draft.messages : [])
+        .filter((message) => message && typeof message === "object")
+        .slice().sort(comparePendingInboundMessages);
+      if (!queued.length) {
+        this.pendingImageInboundByScope.delete(scopeKey);
+        this.pendingImageBatchStore.save(this.pendingImageInboundByScope);
+        return false;
+      }
+      if (this.isTurnDispatchBlocked(draft.bindingKey, draft.workspaceRoot)) {
+        this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot);
+        return false;
+      }
+
+      const { batchMessages, remainingMessages } = takeImageOnlyBatchMessages(
+        queued, MAX_INBOUND_STICKER_IMAGE_BATCH
+      );
+      if (!batchMessages.length) return false;
+      const prepared = buildMergedInboundPrepared({
+        bindingKey: draft.bindingKey,
+        workspaceRoot: draft.workspaceRoot,
+        messages: batchMessages,
+        trailingPrepared,
+      });
+      const dispatched = await this.dispatchPreparedTurn({
+        bindingKey: draft.bindingKey,
+        workspaceRoot: draft.workspaceRoot,
+        prepared,
+      });
+      if (!dispatched) {
+        this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot);
+        return false;
+      }
+      // Keep the batch in the saved file until the turn is accepted by the runtime.
+      if (remainingMessages.length) {
+        this.pendingImageInboundByScope.set(scopeKey, {
+          bindingKey: draft.bindingKey,
+          workspaceRoot: draft.workspaceRoot,
+          messages: remainingMessages,
+          timer: null,
+        });
+      } else {
         this.pendingImageInboundByScope.delete(scopeKey);
       }
-      return false;
+      this.pendingImageBatchStore.save(this.pendingImageInboundByScope);
+      if (remainingMessages.length) {
+        this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot, 100);
+      }
+      return true;
+    } finally {
+      this.pendingImageFlushScopes.delete(scopeKey);
     }
-
-    this.clearPendingImageInboundTimer(scopeKey);
-    this.pendingImageInboundByScope.delete(scopeKey);
-
-    const queued = Array.isArray(draft.messages)
-      ? draft.messages
-        .filter((message) => message && typeof message === "object")
-        .slice()
-        .sort(comparePendingInboundMessages)
-      : [];
-    if (!queued.length) {
-      return false;
-    }
-
-    const { batchMessages, remainingMessages } = takeImageOnlyBatchMessages(queued, MAX_INBOUND_STICKER_IMAGE_BATCH);
-    if (!batchMessages.length) {
-      return false;
-    }
-
-    if (remainingMessages.length) {
-      this.pendingImageInboundByScope.set(scopeKey, {
-        bindingKey: draft.bindingKey,
-        workspaceRoot: draft.workspaceRoot,
-        messages: remainingMessages,
-        timer: null,
-      });
-    }
-
-    const prepared = buildMergedInboundPrepared({
-      bindingKey: draft.bindingKey,
-      workspaceRoot: draft.workspaceRoot,
-      messages: batchMessages,
-      trailingPrepared,
-    });
-    await this.routePreparedInbound({
-      bindingKey: draft.bindingKey,
-      workspaceRoot: draft.workspaceRoot,
-      prepared,
-    });
-
-    if (remainingMessages.length) {
-      await this.flushPendingImageInboundBatch({
-        bindingKey: draft.bindingKey,
-        workspaceRoot: draft.workspaceRoot,
-      });
-    }
-
-    return true;
   }
 
   bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared }) {
