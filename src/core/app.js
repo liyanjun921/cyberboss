@@ -49,7 +49,11 @@ const RETRY_DELAY_MS = 2_000;
 const BACKOFF_DELAY_MS = 30_000;
 const MAX_CONSECUTIVE_FAILURES = 3;
 const MAX_INBOUND_STICKER_IMAGE_BATCH = 10;
-const INBOUND_IMAGE_BATCH_IDLE_MS = 1_500;
+// How long to wait after the last image before flushing a chat-scoped batch.
+const INBOUND_IMAGE_BATCH_IDLE_MS = (() => {
+  const value = Number.parseInt(process.env.CYBERBOSS_IMAGE_BATCH_IDLE_MS || "", 10);
+  return Number.isSafeInteger(value) ? Math.max(250, Math.min(value, 60_000)) : 6_000;
+})();
 
 function createRuntimeAdapter(config) {
   if (config.runtime === "claudecode") {
