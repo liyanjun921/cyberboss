@@ -141,7 +141,7 @@ function createWeixinChannelAdapter(config) {
       saveSyncBuffer(config, account.accountId, buffer);
     },
     rememberContextToken,
-    async getUpdates({ syncBuffer = "", timeoutMs = LONG_POLL_TIMEOUT_MS } = {}) {
+    async getUpdates({ syncBuffer = "", timeoutMs = LONG_POLL_TIMEOUT_MS, persistBuffer = true } = {}) {
       const account = ensureAccount();
       const response = await getUpdates({
         baseUrl: account.baseUrl,
@@ -150,7 +150,7 @@ function createWeixinChannelAdapter(config) {
         timeoutMs,
       });
       const newBuf = typeof response?.get_updates_buf === "string" ? response.get_updates_buf.trim() : "";
-      if (newBuf && newBuf !== syncBuffer) {
+      if (persistBuffer && newBuf && newBuf !== syncBuffer) {
         this.saveSyncBuffer(newBuf);
       }
       const messages = Array.isArray(response?.msgs) ? response.msgs : [];
