@@ -71,7 +71,31 @@ npm run build
 node .\dist\cli.js check
 ```
 
-Then start the Bridge manually in the same PowerShell process after setting its Garden connection variables. The Garden machine token belongs to the Bridge only; the official Bridge must not forward it to the injector. Do not paste the token into chat, source files, command history, or Git.
+The Bridge uses `GARDEN_BASE_URL` (default `https://wake-v1.abysslumina.com`) and requires `GARDEN_MACHINE_TOKEN`. Set the machine token only in this local PowerShell process using your normal secure local secret-entry method; do not paste it into chat, source files, command history, or Git. The official Bridge removes `GARDEN_MACHINE_TOKEN` from the injector child process environment.
+
+After the Bridge repository has been built and the Garden variables are available in this same PowerShell process, run:
+
+```powershell
+Push-Location $GardenBridgeRoot
+try {
+    node .\\dist\\cli.js check
+    if ($LASTEXITCODE -ne 0) {
+        throw "Garden Bridge check failed; do not start the SSE connection."
+    }
+
+    # This opens one SSE connection. If it disconnects or is rejected,
+    # the process exits; diagnose the cause and restart manually.
+    node .\\dist\\cli.js run
+    if ($LASTEXITCODE -ne 0) {
+        throw "Garden Bridge stopped with exit code $LASTEXITCODE."
+    }
+}
+finally {
+    Pop-Location
+}
+```
+
+Do not add a watchdog, scheduled restart, or automatic reconnect.
 
 ## Safety and operating rules
 
