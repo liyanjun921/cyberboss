@@ -163,9 +163,9 @@ function createWeixinChannelAdapter(config) {
       }
       return response;
     },
-    normalizeIncomingMessage(message) {
+    normalizeIncomingMessage(message, options = {}) {
       const account = ensureAccount();
-      return inboundFilter.normalize(message, config, account.accountId);
+      return inboundFilter.normalize(message, config, account.accountId, options);
     },
     async sendText({ userId, text, contextToken = "", preserveBlock = false }) {
       await sendTextChunks({ userId, text, contextToken, preserveBlock });
