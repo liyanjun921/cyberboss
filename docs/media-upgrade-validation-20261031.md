@@ -1,3 +1,24 @@
+# 2026-10-31｜第三轮验证：待处理文字持久化与安全安装前检查
+
+**GitHub Actions run 41168951418：success，28/28 测试通过，0 失败**。已执行 `npm ci --ignore-scripts --no-audit --no-fund`、全部 `npm run check` 和 28 项隔离测试。仍未 Windows 本机部署。
+
+## 真正修复的边界
+- `app.js` 中 `pendingInboundByScope` 的普通文字/待处理消息之前仅存内存，且微信原始消息已被确认。电脑崩溃有丢失风险。
+- 现在使用 `stateDir/pending-turn-batches.json` 持久化缓冲；仅当发送成功获 Codex 接纳后清除，故障时保留；新到达的消息保留，不因旧批次成功而覆盖。
+- `routePreparedInbound` 在 Codex 忙碌时，把消息可靠缓冲后返回成功；Codex 调度返回失败时由 `handlePreparedMessage` 抛错，原始队列项**不被提前 ack**。
+- 新增 `test/pending-turn-durability.test.js` 四项：忙碌期写入、失败时保留/成功后清除、发送失败拒绝 ack、落盘失败不 ack。
+- 新增 Windows 只读检测工具包（本轮 ChatGPT 会话已交付 ZIP）：可核查实际源码路径、关键文件 hash 前缀、Git tracked changes、统一管理器状态；不会修改或上传私有记忆。
+- 这套功能依然是“至少一次”处理；远端请求与本地持久记录提交之间有崩溃窗口，**不能承诺 exactly-once**。
+
+## 下一步部署门槛
+- 必须由用户 Windows 本机只读检测取得**当前启动器路径及文件指纹**，再比对 PR #2，禁止直接覆盖不相同源码。
+- 备份源码和原有状态，包括 `AGENTS.md`、V3.4 记忆文件和统一管理器（保持本地），审核部署影响。
+- 在测试副本验证恢复与审批，真实微信图片/动图/12图/长时间断网/重启后消息恢复，最后才可进入正式切换。
+- 本地 `inbound-spool.json`、`pending-turn-batches.json` 和 `pending-image-batches.json` 含聊天内容或令牌，均不得进入 Git 仓库、日志或分享给外部。
+- 现有运行中用户的 Windows Cyberboss、微信帐号、Codex 8765 和私有 GitHub 共享记忆**未修改**。
+
+---
+
 # 2026-10-31｜第二轮修复验收：后台媒体队列与文件发送权限
 
 GitHub Actions 运行 **41167073846**：**success**，`npm run check` 通过，`node --test` **24/24 PASS，0 FAIL**。此结果是 GitHub Node 22 隔离测试，不是 Windows 上微信端真实验收。
