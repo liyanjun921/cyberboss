@@ -682,19 +682,23 @@ class CyberbossApp {
         this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot);
         return false;
       }
-      // Keep the batch in the saved file until the turn is accepted by the runtime.
-      if (remainingMessages.length) {
+      // New images may arrive while sendTurn is pending. Preserve those newer entries;
+      // otherwise a concurrent append would be silently dropped when replacing the draft.
+      const latest = this.pendingImageInboundByScope.get(scopeKey);
+      const newArrivals = (latest?.messages || []).slice(draft.messages.length);
+      const unprocessed = [...remainingMessages, ...newArrivals];
+      if (unprocessed.length) {
         this.pendingImageInboundByScope.set(scopeKey, {
           bindingKey: draft.bindingKey,
           workspaceRoot: draft.workspaceRoot,
-          messages: remainingMessages,
-          timer: null,
+          messages: unprocessed,
+          timer: latest?.timer || null,
         });
       } else {
         this.pendingImageInboundByScope.delete(scopeKey);
       }
       this.pendingImageBatchStore.save(this.pendingImageInboundByScope);
-      if (remainingMessages.length) {
+      if (unprocessed.length) {
         this.schedulePendingImageInboundFlush(scopeKey, draft.bindingKey, draft.workspaceRoot, 100);
       }
       return true;
