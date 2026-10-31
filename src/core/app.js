@@ -472,7 +472,11 @@ class CyberbossApp {
       await this.flushPendingImageInboundBatch({ bindingKey, workspaceRoot });
     }
 
-    await this.routePreparedInbound({ bindingKey, workspaceRoot, prepared });
+    const accepted = await this.routePreparedInbound({ bindingKey, workspaceRoot, prepared });
+    if (!accepted) {
+      // Preserve the raw message in the durable spool for retry.
+      throw new Error("Codex did not accept the incoming turn; retaining inbound spool item");
+    }
   }
 
   isTurnDispatchBlocked(bindingKey, workspaceRoot, { ignoreBoundary = false } = {}) {
@@ -576,8 +580,9 @@ class CyberbossApp {
 
   async routePreparedInbound({ bindingKey, workspaceRoot, prepared }) {
     if (this.isTurnDispatchBlocked(bindingKey, workspaceRoot)) {
+      // The prepared turn is already persisted to disk by this method.
       this.bufferPendingInboundMessage({ bindingKey, workspaceRoot, prepared });
-      return false;
+      return true;
     }
     return this.dispatchPreparedTurn({ bindingKey, workspaceRoot, prepared });
   }
