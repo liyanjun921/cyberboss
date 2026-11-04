@@ -1,0 +1,29 @@
+name: Live2D body integration tests
+
+on:
+  push:
+    branches:
+      - feat/live2d-body-v1-20261105
+    paths:
+      - "integrations/live2d-body/**"
+      - "test/live2d-body.test.js"
+      - ".github/workflows/live2d-body.yml"
+  pull_request:
+    paths:
+      - "integrations/live2d-body/**"
+      - "test/live2d-body.test.js"
+      - ".github/workflows/live2d-body.yml"
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: node --check integrations/live2d-body/inject-touch.js
+      - run: node --check integrations/live2d-body/pet-cli.js
+      - run: node --test test/live2d-body.test.js
