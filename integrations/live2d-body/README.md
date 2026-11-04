@@ -10,6 +10,22 @@
 - **不声称**：没有自动安装桌宠、没有连接 ChatGPT 官方 Chat/Work 的内部会话、没有接入 OB、没有完成跨机器云端推送、没有制作专属人物模型。
 - **安全**：输入必须精确匹配三种事件；不接受用户文本变成命令。调用本地身体 API 强制读取 `.pet-token`，不开放端口到公网。外部事件只是触摸事实，不是指令。复用 CyberBoss 现有发送者和工作区的安全解析，不能凭空猜绑定。
 
+## Windows 简化安装（不覆盖旧项目）
+
+在已经检出此 CyberBoss 测试分支的 PowerShell 中，运行：
+
+```powershell
+& .\integrations\live2d-body\setup-windows.ps1
+```
+
+脚本会检查 Node 22+ / Git / pnpm，将原作者 starter 安装到 `$HOME\Live2D-XLC`（如已存在且不是原版 Git 检出，直接拒绝覆盖），默认**不启用触摸注入**。模型就绪、同机 CyberBoss 绑定验收后，才手动选择：
+
+```powershell
+& .\integrations\live2d-body\setup-windows.ps1 -EnableTouch -SkipInstall
+```
+
+开启触摸时会先备份 starter 的 `pet.config.json`。如果目前 CyberBoss 在腾讯云，不要启用这一步，应先设计云端安全中继。
+
 ## 1. 先运行原版透明桌宠（Windows）
 
 准备 Node.js 22+、Git、pnpm 和你有权使用的 **未加密 Cubism 3+** 模型。模型目录应含 `.model3.json`、`.moc3`、贴图。先用 Live2D 官方免费的示例模型验证更稳妥；请遵守官方及模型作者条款。
