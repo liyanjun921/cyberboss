@@ -15,10 +15,10 @@
 在已经检出此 CyberBoss 测试分支的 PowerShell 中，运行：
 
 ```powershell
-& .\integrations\live2d-body\setup-windows.ps1
+& .\integrations\live2d-body\setup-windows.ps1 -InstallSampleModel
 ```
 
-脚本会检查 Node 22+ / Git / pnpm，将原作者 starter 安装到 `$HOME\Live2D-XLC`（如已存在且不是原版 Git 检出，直接拒绝覆盖），默认**不启用触摸注入**。模型就绪、同机 CyberBoss 绑定验收后，才手动选择：
+脚本会检查 Node 22+ / Git / pnpm，将原作者 starter 安装到 `$HOME\Live2D-XLC`（如已存在且不是原版 Git 检出，直接拒绝覆盖），通过官方地址直接下载 Hiyori 免费样例并设置模型路径（须遵守 Live2D 官方示例授权），默认**不启用触摸注入**。模型就绪、同机 CyberBoss 绑定验收后，才手动选择：
 
 ```powershell
 & .\integrations\live2d-body\setup-windows.ps1 -EnableTouch -SkipInstall
