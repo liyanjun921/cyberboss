@@ -71,6 +71,28 @@ async function apiPost({ baseUrl, endpoint, token, body, timeoutMs = 0, label })
       throw new Error(`${label} http ${response.status}: ${redactSensitiveText(truncateForLog(raw, 512))}`);
     }
     return raw;
+  } catch (error) {
+    // Network failures from Node/undici often only say "fetch failed". Expose
+    // transport error codes without logging authorization headers or bodies.
+    if (error?.name === "AbortError" || error?.name === "TimeoutError") {
+      throw error;
+    }
+    const codes = [];
+    const collect = (cause) => {
+      if (!cause || typeof cause !== "object") return;
+      if (typeof cause.code === "string" && /^[A-Z0-9_]+$/.test(cause.code)) {
+        codes.push(cause.code);
+      }
+      if (Array.isArray(cause.errors)) cause.errors.forEach(collect);
+    };
+    collect(error?.cause);
+    const uniqueCodes = Array.from(new Set(codes)).slice(0, 6);
+    if (uniqueCodes.length) {
+      const wrapped = new Error(`${label} ${endpoint} failed: ${error.message}; network_codes=${uniqueCodes.join(",")}`);
+      wrapped.cause = error;
+      throw wrapped;
+    }
+    throw error;
   } finally {
     clearTimeout(timer);
   }
