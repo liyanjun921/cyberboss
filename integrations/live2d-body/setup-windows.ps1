@@ -1,6 +1,7 @@
 param(
   [string]$InstallDir = (Join-Path $HOME "Live2D-XLC"),
   [switch]$EnableTouch,
+  [switch]$InstallSampleModel,
   [switch]$SkipInstall
 )
 
@@ -54,6 +55,37 @@ if (-not $SkipInstall) {
 
 $configPath = Join-Path $InstallDir "pet.config.json"
 if (-not (Test-Path -LiteralPath $configPath)) { throw "pet.config.json not found" }
+
+if ($InstallSampleModel) {
+  # Download directly from Live2D's official sample URL, no bundled/redistributed model.
+  $modelRoot = Join-Path $InstallDir "src/renderer/public/model/hiyori-official"
+  if (Test-Path -LiteralPath $modelRoot) {
+    throw "Sample model folder already exists; refusing to overwrite: $modelRoot"
+  }
+  $archive = Join-Path ([System.IO.Path]::GetTempPath()) ("hiyori-official-" + [guid]::NewGuid().ToString("N") + ".zip")
+  try {
+    Write-Host "Downloading official Hiyori sample. Please respect Live2D sample license."
+    Invoke-WebRequest -Uri "https://cubism.live2d.com/sample-data/bin/hiyori/hiyori_en.zip" -OutFile $archive -UseBasicParsing
+    New-Item -Path $modelRoot -ItemType Directory -Force | Out-Null
+    Expand-Archive -LiteralPath $archive -DestinationPath $modelRoot -Force
+    $modelFile = Get-ChildItem -LiteralPath $modelRoot -File -Recurse -Filter "*.model3.json" |
+      Select-Object -First 1
+    if (-not $modelFile) { throw "Official ZIP had no .model3.json model" }
+    $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+    $relative = $modelFile.FullName.Substring($modelRoot.Length + 1).Replace("\", "/")
+    $modelPath = "model/hiyori-official/$relative"
+    $backupPath = "$configPath.backup-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    Copy-Item -LiteralPath $configPath -Destination $backupPath
+    $config.model.path = $modelPath
+    $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+    $json = $config | ConvertTo-Json -Depth 30
+    [System.IO.File]::WriteAllText($configPath, $json, $utf8NoBom)
+    Write-Host "Official sample model configured: $modelPath"
+    Write-Host "Config backup: $backupPath"
+  } finally {
+    Remove-Item -LiteralPath $archive -ErrorAction SilentlyContinue
+  }
+}
 
 if ($EnableTouch) {
   if (-not (Test-Path -LiteralPath $injector)) { throw "CyberBoss injector not found" }
