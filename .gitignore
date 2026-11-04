@@ -7,3 +7,5 @@ node_modules/
 npm-debug.log*
 third_party/
 firmware/
+# 跨端对话补传包含私人原话。
+ombre-outbox/

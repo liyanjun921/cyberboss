@@ -40,6 +40,10 @@ function mapCodexMessageToRuntimeEvent(message) {
   }
 
   if (method === "turn/completed") {
+    const status = normalizeString(params?.turn?.status).toLowerCase();
+    if (["failed", "interrupted", "cancelled", "canceled"].includes(status)) {
+      return { type: "runtime.turn.failed", payload: { threadId, turnId, text: extractFailureText(params) } };
+    }
     return {
       type: "runtime.turn.completed",
       payload: {

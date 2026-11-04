@@ -3,12 +3,13 @@ const { sanitizeProtocolLeakText } = require("../adapters/runtime/codex/protocol
 const CURRENT_REPLY_HEADER = "===== 本轮模型回复 =====";
 
 class StreamDelivery {
-  constructor({ channelAdapter, sessionStore, runtimeId = "", onDeferredSystemReply, systemReplyRetryScheduleMs, sameTokenRetryDelayMs }) {
+  constructor({ channelAdapter, sessionStore, runtimeId = "", onDeferredSystemReply, onDeliveredReply, systemReplyRetryScheduleMs, sameTokenRetryDelayMs }) {
     this.channelAdapter = channelAdapter;
     this.sessionStore = sessionStore;
     this.runtimeId = normalizeRuntimeId(runtimeId);
     this.systemReplyPolicy = createSystemReplyPolicy(this.runtimeId);
     this.onDeferredSystemReply = typeof onDeferredSystemReply === "function" ? onDeferredSystemReply : null;
+    this.onDeliveredReply = typeof onDeliveredReply === "function" ? onDeliveredReply : null;
     this.systemReplyRetryScheduleMs = Array.isArray(systemReplyRetryScheduleMs) && systemReplyRetryScheduleMs.length
       ? systemReplyRetryScheduleMs.map((value) => Number(value)).filter((value) => Number.isFinite(value) && value >= 0)
       : [1_500, 2_500, 4_000, 6_000];
@@ -378,7 +379,15 @@ class StreamDelivery {
     if (prependDeferredPrefix) {
       payload.preserveBlock = true;
     }
-    await this.sendTextWithRetry(state, payload, { kind: "plain_reply" });
+    const delivered = await this.sendTextWithRetry(state, payload, { kind: "plain_reply" });
+    if (delivered && this.onDeliveredReply) {
+      try {
+        this.onDeliveredReply({ threadId: state.threadId, turnId: state.turnId, itemId: delivery.itemId,
+          text: baseText, provider: state.replyTarget.provider });
+      } catch {
+        console.error("[cyberboss] 共享记忆归档队列写入失败");
+      }
+    }
   }
 
   async sendSystemReply(state, text) {
@@ -395,13 +404,13 @@ class StreamDelivery {
     const initialTarget = state.replyTarget;
     try {
       await this.channelAdapter.sendText(payload);
-      return;
+      return true;
     } catch (error) {
       const retryTarget = this.resolveRetriableReplyTarget(initialTarget, error);
       if (!retryTarget) {
         const deferred = await this.deferSystemReply(state, payload.text, error, kind);
         if (deferred) {
-          return;
+          return false;
         }
         throw error;
       }
@@ -426,10 +435,11 @@ class StreamDelivery {
             provider: retryTarget.provider,
           });
         }
+        return true;
       } catch (retryError) {
         const deferred = await this.deferSystemReply(state, payload.text, retryError, kind);
         if (deferred) {
-          return;
+          return false;
         }
         throw retryError;
       }
