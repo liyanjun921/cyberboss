@@ -68,7 +68,9 @@ if ($EnableTouch) {
     double = "[pet-touch] 你被戳了一下！"
     dizzy = "[pet-touch] 你被晃晕了！"
   }
-  $config | ConvertTo-Json -Depth 30 | Set-Content -LiteralPath $configPath -Encoding UTF8
+  $utf8NoBom = New-Object System.Text.UTF8Encoding $false
+  $json = $config | ConvertTo-Json -Depth 30
+  [System.IO.File]::WriteAllText($configPath, $json, $utf8NoBom)
   Write-Host "Touch injector enabled. Original config backup: $backupPath"
   Write-Warning "This only reaches the SAME-MACHINE CyberBoss bound session; not the cloud CyberBoss."
 } else {
